@@ -331,7 +331,7 @@ wheels = [
 
 [[package]]
 name = "dspy-codex-auth"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "dspy" },

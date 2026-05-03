@@ -17,17 +17,11 @@ This package is intentionally narrow:
 uv add dspy-codex-auth
 ```
 
-Until the first PyPI release is installed in your environment, install from the
-GitHub repo:
-
-```bash
-uv add "dspy-codex-auth @ git+https://github.com/hrbatra/dspy-codex-auth.git@main"
-```
-
 ## Login
 
 If you already have Codex credentials in `~/.pi/agent/auth.json`, no extra
-login is needed.
+login is needed. The package reads and refreshes that Pi-compatible credential
+file directly.
 
 Otherwise:
 
@@ -47,8 +41,34 @@ lm = dspy.LM("codex/gpt-5.5", cache=False)
 dspy.configure(lm=lm, adapter=dspy.JSONAdapter())
 ```
 
+Use `codex/<model>` for the ChatGPT Codex subscription route. This is not the
+OpenAI API key route and does not require `OPENAI_API_KEY`.
+
 `cache=False` is recommended for Codex while iterating because stale DSPy cache
 entries can preserve old empty-output responses across package upgrades.
+
+## Swapping Models
+
+Call `dspy_codex_auth.install()` once near process startup. Codex model strings
+use subscription auth; non-Codex model strings continue through DSPy's normal LM
+behavior.
+
+```python
+import dspy
+import dspy_codex_auth
+
+dspy_codex_auth.install()
+
+
+def configure_model(model: str, **kwargs):
+    lm = dspy.LM(model, **kwargs)
+    dspy.configure(lm=lm, adapter=dspy.JSONAdapter())
+    return lm
+
+
+codex_lm = configure_model("codex/gpt-5.5", cache=False)
+api_lm = configure_model("openai/gpt-5.5", api_key="...", cache=False)
+```
 
 ## Reasoning Summary
 
@@ -85,6 +105,9 @@ lm = dspy_codex_auth.LM(
     reasoning_summary="detailed",
 )
 ```
+
+This is useful when the rest of your app treats model names as provider-neutral
+strings and you want auth selection to be a separate setting.
 
 ## What It Fixes
 
@@ -196,19 +219,19 @@ uv build --no-sources
 
 ## Release
 
-Releases are published from GitHub Actions with PyPI Trusted Publishing.
-
-For the first release, create a pending PyPI publisher for:
-
-- PyPI project: `dspy-codex-auth`
-- Owner: `hrbatra`
-- Repository: `dspy-codex-auth`
-- Workflow: `publish.yml`
-- Environment: `pypi`
-
-Then tag and push:
+Build and publish from a clean checkout:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+uv version --bump patch
+rm -rf dist
+uv build --no-sources
+uv run --with twine python -m twine upload dist/*
+```
+
+The GitHub Actions publish workflow can also publish tags if PyPI Trusted
+Publishing is configured for this repository:
+
+```bash
+git tag v$(uv version --short)
+git push origin v$(uv version --short)
 ```
