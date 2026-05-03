@@ -6,10 +6,9 @@ import time
 from types import SimpleNamespace
 
 import dspy
-import dspy_lm_auth
-from dspy_lm_auth.auth import AuthStorage
 
 import dspy_codex_auth
+from dspy_codex_auth.auth import AuthStorage
 import dspy_codex_auth.lm as codex_lm
 
 
@@ -223,7 +222,7 @@ def test_non_codex_routes_fall_through(monkeypatch):
             usage={},
         )
 
-    monkeypatch.setattr(dspy_lm_auth.LM, "forward", fake_forward)
+    monkeypatch.setattr(codex_lm._DSPY_LM, "forward", fake_forward)
 
     lm = dspy_codex_auth.LM(
         "openai/test", api_key="dummy", api_base="http://example.invalid"

@@ -20,7 +20,6 @@ classifiers = [
 ]
 dependencies = [
     "dspy>=3.2.0",
-    "dspy-lm-auth>=0.1.3",
     "litellm>=1.82.6",
     "requests>=2.33.1",
 ]

@@ -335,7 +335,6 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "dspy" },
-    { name = "dspy-lm-auth" },
     { name = "litellm" },
     { name = "requests" },
 ]
@@ -349,7 +348,6 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "dspy", specifier = ">=3.2.0" },
-    { name = "dspy-lm-auth", specifier = ">=0.1.3" },
     { name = "litellm", specifier = ">=1.82.6" },
     { name = "requests", specifier = ">=2.33.1" },
 ]
@@ -358,19 +356,6 @@ requires-dist = [
 dev = [
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "ruff", specifier = ">=0.15.12" },
-]
-
-[[package]]
-name = "dspy-lm-auth"
-version = "0.1.3"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "dspy" },
-    { name = "requests" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/47/05/5c2af92dc2dfbf9a50346b20924d427ae292ab66357322e5c2533497ba8c/dspy_lm_auth-0.1.3.tar.gz", hash = "sha256:399433296691e5ef6fb6610457c6752005c9ebaec09e18061bf28a4f9ec870e6", size = 21909, upload-time = "2026-03-11T17:19:53.456Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/d3/d4/063452617a0cc95e4b120a0777e54330ea2939deb22c384817ce87347789/dspy_lm_auth-0.1.3-py3-none-any.whl", hash = "sha256:67102c73bf20e2e5736ae65fba4aff05c7d8a8f6a5dec302ea71c78bf097491f", size = 16244, upload-time = "2026-03-11T17:19:52.253Z" },
 ]
 
 [[package]]

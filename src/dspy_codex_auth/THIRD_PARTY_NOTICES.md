@@ -1,7 +1,7 @@
 # Third-Party Notices
 
-`dspy-codex-auth` interoperates with and adapts implementation patterns from
-`dspy-lm-auth`:
+`dspy-codex-auth` includes and adapts MIT-licensed auth and DSPy integration
+code from `dspy-lm-auth`:
 
 https://github.com/MaximeRivest/dspy-lm-auth
 

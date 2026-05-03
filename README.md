@@ -5,11 +5,11 @@ language model.
 
 This package is intentionally narrow:
 
-- It relies on `dspy-lm-auth` for OAuth login, token refresh, and Pi-compatible
+- It includes ChatGPT/Codex OAuth login, token refresh, and Pi-compatible
   credential storage.
 - It installs a DSPy `LM` wrapper for `codex/...` model strings.
 - It fixes Codex Responses streaming shapes that DSPy 3.2 cannot parse from
-  the current `dspy-lm-auth` PyPI release.
+  the current Codex backend response stream.
 
 ## Install
 
@@ -172,8 +172,8 @@ print(lm.history[-1]["outputs"][0].get("reasoning_content"))
 
 ## Attribution
 
-`dspy-codex-auth` interoperates with and adapts implementation patterns from
-`dspy-lm-auth`:
+`dspy-codex-auth` includes and adapts MIT-licensed auth and DSPy integration
+code from `dspy-lm-auth`:
 
 https://github.com/MaximeRivest/dspy-lm-auth
 
