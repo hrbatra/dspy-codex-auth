@@ -1,0 +1,195 @@
+# dspy-codex-auth
+
+DSPy integration for using ChatGPT/Codex subscription credentials as a DSPy
+language model.
+
+This package is intentionally narrow:
+
+- It relies on `dspy-lm-auth` for OAuth login, token refresh, and Pi-compatible
+  credential storage.
+- It installs a DSPy `LM` wrapper for `codex/...` model strings.
+- It fixes Codex Responses streaming shapes that DSPy 3.2 cannot parse from
+  the current `dspy-lm-auth` PyPI release.
+
+## Install
+
+```bash
+uv add dspy-codex-auth
+```
+
+Until the first PyPI release is installed in your environment, install from the
+GitHub repo:
+
+```bash
+uv add "dspy-codex-auth @ git+https://github.com/hrbatra/dspy-codex-auth.git@main"
+```
+
+## Login
+
+If you already have Codex credentials in `~/.pi/agent/auth.json`, no extra
+login is needed.
+
+Otherwise:
+
+```bash
+uv run python -c "import dspy_codex_auth; dspy_codex_auth.login()"
+```
+
+## Basic Usage
+
+```python
+import dspy
+import dspy_codex_auth
+
+dspy_codex_auth.install()
+
+lm = dspy.LM("codex/gpt-5.5", cache=False)
+dspy.configure(lm=lm, adapter=dspy.JSONAdapter())
+```
+
+`cache=False` is recommended for Codex while iterating because stale DSPy cache
+entries can preserve old empty-output responses across package upgrades.
+
+## Reasoning Summary
+
+Pass `reasoning_effort` as usual. This package also supports
+`reasoning_summary`, which maps to the Responses API `reasoning.summary` field.
+
+```python
+lm = dspy.LM(
+    "codex/gpt-5.5",
+    cache=False,
+    reasoning_effort="medium",
+    reasoning_summary="detailed",
+)
+```
+
+DSPy predictions expose declared output fields. The lower-level LM history can
+also include a returned reasoning summary:
+
+```python
+summary = lm.history[-1]["outputs"][0].get("reasoning_content")
+```
+
+## OpenAI-Style Model String With Codex Auth
+
+If you prefer to keep an `openai/...` model string and select Codex auth
+explicitly:
+
+```python
+lm = dspy_codex_auth.LM(
+    "openai/gpt-5.5",
+    auth_provider="codex",
+    cache=False,
+    reasoning_effort="medium",
+    reasoning_summary="detailed",
+)
+```
+
+## What It Fixes
+
+The ChatGPT Codex backend streams useful output events, but the completed
+LiteLLM Responses object can arrive with `response.output == []`. DSPy expects
+Responses output items to contain final message text, function calls, and
+reasoning summaries. This package reconstructs those output items from stream
+events before DSPy parses the response.
+
+It currently handles:
+
+- `response.output_item.done`
+- `response.output_text.done`
+- `response.output_text.delta`
+- `response.reasoning_summary_text.done`
+- `response.reasoning_summary_text.delta`
+- streamed function-call output items
+
+It also strips output-token cap fields that the Codex backend currently rejects:
+
+- `max_tokens`
+- `max_output_tokens`
+- `max_completion_tokens`
+
+## French Example
+
+```python
+import dspy
+import dspy_codex_auth
+
+dspy_codex_auth.install()
+
+lm = dspy.LM("codex/gpt-5.5", cache=False)
+dspy.configure(lm=lm, adapter=dspy.JSONAdapter())
+
+
+class TranslateFrenchToEnglish(dspy.Signature):
+    """Translate the French input into short, natural English."""
+
+    french: str = dspy.InputField(desc="French sentence")
+    english: str = dspy.OutputField(desc="Natural English translation")
+
+
+translator = dspy.Predict(TranslateFrenchToEnglish)
+print(translator(french="merci beaucoup").english)
+```
+
+## Math Example With Reasoning Summary
+
+```python
+import dspy
+import dspy_codex_auth
+
+dspy_codex_auth.install()
+
+lm = dspy.LM(
+    "codex/gpt-5.5",
+    cache=False,
+    reasoning_effort="medium",
+    reasoning_summary="detailed",
+)
+dspy.configure(lm=lm, adapter=dspy.JSONAdapter())
+
+
+class SolveMath(dspy.Signature):
+    """Solve the math problem. Return a concise numeric answer and a brief explanation."""
+
+    problem: str = dspy.InputField(desc="Math problem")
+    answer: str = dspy.OutputField(desc="Concise final answer")
+    explanation: str = dspy.OutputField(desc="Brief explanation")
+
+
+solver = dspy.Predict(SolveMath)
+pred = solver(
+    problem=(
+        "Compute the integral of the standard normal probability density "
+        "function from 0 to 1.5."
+    )
+)
+
+print(pred.answer)
+print(pred.explanation)
+print(lm.history[-1]["outputs"][0].get("reasoning_content"))
+```
+
+## Attribution
+
+`dspy-codex-auth` interoperates with and adapts implementation patterns from
+`dspy-lm-auth`:
+
+https://github.com/MaximeRivest/dspy-lm-auth
+
+The streamed-output reconstruction addresses a DSPy/Codex Responses streaming
+compatibility issue that was also discussed in `dspy-lm-auth` PR #2:
+
+https://github.com/MaximeRivest/dspy-lm-auth/pull/2
+
+`dspy-lm-auth` is MIT-licensed. The original copyright notice is preserved in
+`THIRD_PARTY_NOTICES.md`.
+
+## Development
+
+```bash
+uv sync --dev
+uv run pytest
+uv run ruff check .
+uv build --no-sources
+```
