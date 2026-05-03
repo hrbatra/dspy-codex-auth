@@ -193,3 +193,22 @@ uv run pytest
 uv run ruff check .
 uv build --no-sources
 ```
+
+## Release
+
+Releases are published from GitHub Actions with PyPI Trusted Publishing.
+
+For the first release, create a pending PyPI publisher for:
+
+- PyPI project: `dspy-codex-auth`
+- Owner: `hrbatra`
+- Repository: `dspy-codex-auth`
+- Workflow: `publish.yml`
+- Environment: `pypi`
+
+Then tag and push:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
