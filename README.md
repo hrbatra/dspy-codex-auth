@@ -219,7 +219,9 @@ uv build --no-sources
 
 ## Release
 
-Build and publish from a clean checkout:
+Full PyPI update instructions are in [RELEASING.md](RELEASING.md).
+
+Short local release flow:
 
 ```bash
 uv version --bump patch
@@ -228,10 +230,4 @@ uv build --no-sources
 uv run --with twine python -m twine upload dist/*
 ```
 
-The GitHub Actions publish workflow can also publish tags if PyPI Trusted
-Publishing is configured for this repository:
-
-```bash
-git tag v$(uv version --short)
-git push origin v$(uv version --short)
-```
+PyPI releases are immutable, so every update needs a new version number.
