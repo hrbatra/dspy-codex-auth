@@ -119,6 +119,10 @@ events before DSPy parses the response.
 
 It currently handles:
 
+- DSPy few-shot and conversation-history assistant messages by encoding them as
+  Responses `output_text` blocks, which supports optimizers such as
+  `LabeledFewShot`.
+- GEPA reflection calls that invoke the LM with a plain prompt string.
 - `response.output_item.done`
 - `response.output_text.done`
 - `response.output_text.delta`

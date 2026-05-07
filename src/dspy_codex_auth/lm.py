@@ -208,7 +208,7 @@ def _convert_content_item_to_responses_format(item: dict[str, Any]) -> dict[str,
             "type": "input_image",
             "image_url": image_url,
         }
-    if item_type in {"text", "input_text"}:
+    if item_type in {"text", "input_text", "output_text"}:
         return {
             "type": "input_text",
             "text": item.get("text", ""),
@@ -224,9 +224,29 @@ def _convert_content_item_to_responses_format(item: dict[str, Any]) -> dict[str,
     return item
 
 
-def _convert_message_content_to_responses_format(content: Any) -> list[dict[str, Any]]:
+def _convert_text_blocks_for_role(
+    blocks: list[dict[str, Any]],
+    *,
+    role: str,
+) -> list[dict[str, Any]]:
+    text_type = "output_text" if role == "assistant" else "input_text"
+    converted: list[dict[str, Any]] = []
+    for block in blocks:
+        if block.get("type") in {"input_text", "output_text"}:
+            converted.append({"type": text_type, "text": block.get("text", "")})
+        else:
+            converted.append(block)
+    return converted
+
+
+def _convert_message_content_to_responses_format(
+    content: Any,
+    *,
+    role: str = "user",
+) -> list[dict[str, Any]]:
     if isinstance(content, str):
-        return [{"type": "input_text", "text": content}]
+        text_type = "output_text" if role == "assistant" else "input_text"
+        return [{"type": text_type, "text": content}]
     if isinstance(content, list):
         blocks: list[dict[str, Any]] = []
         for item in content:
@@ -234,10 +254,11 @@ def _convert_message_content_to_responses_format(content: Any) -> list[dict[str,
                 blocks.append(_convert_content_item_to_responses_format(item))
             elif item is not None:
                 blocks.append({"type": "input_text", "text": str(item)})
-        return blocks
+        return _convert_text_blocks_for_role(blocks, role=role)
     if content is None:
         return []
-    return [{"type": "input_text", "text": str(content)}]
+    text_type = "output_text" if role == "assistant" else "input_text"
+    return [{"type": text_type, "text": str(content)}]
 
 
 def _coerce_response_format(response_format: Any) -> Any:
@@ -274,11 +295,15 @@ def _merge_codex_instructions(
 
 def _build_codex_responses_request(request: dict[str, Any]) -> dict[str, Any]:
     request = dict(request)
-    messages = request.pop("messages", [])
+    raw_messages = request.pop("messages", [])
+    messages = raw_messages if isinstance(raw_messages, list) else []
 
     instructions_from_messages: list[str] = []
     input_messages: list[dict[str, Any]] = []
-    for message in messages:
+    for raw_message in messages:
+        if not isinstance(raw_message, dict):
+            continue
+        message = raw_message
         role = str(message.get("role", "user"))
         content = message.get("content")
         if role in {"system", "developer"}:
@@ -290,7 +315,10 @@ def _build_codex_responses_request(request: dict[str, Any]) -> dict[str, Any]:
         input_messages.append(
             {
                 "role": role,
-                "content": _convert_message_content_to_responses_format(content),
+                "content": _convert_message_content_to_responses_format(
+                    content,
+                    role=role,
+                ),
             }
         )
 
