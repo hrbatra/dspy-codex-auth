@@ -91,6 +91,45 @@ also include a returned reasoning summary:
 summary = lm.history[-1]["outputs"][0].get("reasoning_content")
 ```
 
+## Fast Mode / Service Tier
+
+Codex CLI config uses `service_tier = "fast"` for Fast mode. Internally, the
+CLI normalizes that config value to the backend request tier `priority`; this
+package does the same, so DSPy callers can use the documented Codex config
+spelling directly:
+
+```python
+lm = dspy.LM(
+    "codex/gpt-5.4",
+    cache=False,
+    service_tier="fast",
+    reasoning_effort="low",
+)
+```
+
+`service_tier="priority"` and `service_tier="flex"` are also passed through.
+Omit `service_tier` to use the account and model default.
+
+For raw Codex CLI calls, use `-c` config overrides:
+
+```bash
+codex exec \
+  -m gpt-5.4 \
+  -c 'service_tier="fast"' \
+  -c 'model_reasoning_effort="low"' \
+  --json \
+  'Return exactly the single lowercase word: pink'
+```
+
+The DSPy-facing kwarg is `reasoning_effort`. For convenience, this package also
+accepts Codex config-style aliases `model_reasoning_effort` and
+`model_reasoning_summary`.
+
+Relevant Codex docs:
+
+- [Configuration reference](https://developers.openai.com/codex/config-reference)
+- [Config feature flags](https://developers.openai.com/codex/config-basic#supported-features)
+
 ## OpenAI-Style Model String With Codex Auth
 
 If you prefer to keep an `openai/...` model string and select Codex auth
@@ -135,6 +174,9 @@ It also strips output-token cap fields that the Codex backend currently rejects:
 - `max_tokens`
 - `max_output_tokens`
 - `max_completion_tokens`
+
+It normalizes `service_tier="fast"` to the Codex backend request value
+`service_tier="priority"`, matching Codex CLI behavior.
 
 ## French Example
 

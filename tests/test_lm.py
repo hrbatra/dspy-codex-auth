@@ -103,6 +103,33 @@ def test_codex_request_strips_token_caps_and_accepts_reasoning_summary():
     assert request["reasoning"] == {"effort": "medium", "summary": "detailed"}
 
 
+def test_codex_request_normalizes_fast_service_tier_to_priority():
+    request = codex_lm._build_codex_request(
+        {
+            "model": "openai/gpt-5.4",
+            "messages": [{"role": "user", "content": "hello"}],
+            "service_tier": "fast",
+        }
+    )
+
+    assert request["service_tier"] == "priority"
+
+
+def test_codex_request_accepts_codex_config_reasoning_aliases():
+    request = codex_lm._build_codex_request(
+        {
+            "model": "openai/gpt-5.4",
+            "messages": [{"role": "user", "content": "hello"}],
+            "model_reasoning_effort": "low",
+            "model_reasoning_summary": "concise",
+        }
+    )
+
+    assert "model_reasoning_effort" not in request
+    assert "model_reasoning_summary" not in request
+    assert request["reasoning"] == {"effort": "low", "summary": "concise"}
+
+
 def test_codex_request_encodes_assistant_messages_as_output_text():
     request = codex_lm._build_codex_request(
         {

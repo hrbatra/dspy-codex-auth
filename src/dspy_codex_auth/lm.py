@@ -273,6 +273,18 @@ def _coerce_response_format(response_format: Any) -> Any:
     return response_format
 
 
+def _normalize_codex_service_tier(service_tier: Any) -> Any:
+    if not isinstance(service_tier, str):
+        return service_tier
+
+    normalized = service_tier.lower()
+    if normalized == "fast":
+        return "priority"
+    if normalized in {"priority", "flex"}:
+        return normalized
+    return service_tier
+
+
 def _merge_codex_instructions(
     explicit_instructions: Any,
     instruction_messages: list[str],
@@ -338,6 +350,11 @@ def _build_codex_responses_request(request: dict[str, Any]) -> dict[str, Any]:
     if "reasoning_effort" in request:
         effort = request.pop("reasoning_effort")
         request["reasoning"] = {"effort": effort, "summary": "auto"}
+
+    if "service_tier" in request:
+        service_tier = request.pop("service_tier")
+        if service_tier is not None:
+            request["service_tier"] = _normalize_codex_service_tier(service_tier)
 
     if "response_format" in request:
         response_format = _coerce_response_format(request.pop("response_format"))
@@ -566,6 +583,16 @@ async def _aconsume_codex_response_stream(response_stream: Any) -> Any:
 
 def _build_codex_request(request: dict[str, Any]) -> dict[str, Any]:
     request = dict(request)
+    if "reasoning_effort" not in request and "model_reasoning_effort" in request:
+        request["reasoning_effort"] = request.pop("model_reasoning_effort")
+    else:
+        request.pop("model_reasoning_effort", None)
+
+    if "reasoning_summary" not in request and "model_reasoning_summary" in request:
+        request["reasoning_summary"] = request.pop("model_reasoning_summary")
+    else:
+        request.pop("model_reasoning_summary", None)
+
     reasoning_summary = request.pop("reasoning_summary", None)
     request = _build_codex_responses_request(request)
 
