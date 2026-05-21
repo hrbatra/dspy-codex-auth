@@ -50,6 +50,20 @@ class FakeResponsesStream:
         return iter(self._events)
 
 
+class RemoteProtocolError(Exception):
+    pass
+
+
+class BrokenResponsesStream:
+    def __init__(self):
+        self.completed_response = SimpleNamespace(response=make_response())
+
+    def __iter__(self):
+        raise RemoteProtocolError(
+            "peer closed connection without sending complete message body"
+        )
+
+
 def make_response(output=None) -> SimpleNamespace:
     return SimpleNamespace(
         output=output or [], model="gpt-5.5", usage={}, _hidden_params={}
@@ -84,8 +98,10 @@ def test_forward_skips_usage_tracking_when_usage_is_none(monkeypatch):
 
     tracker = FakeUsageTracker()
     with dspy.context(usage_tracker=tracker):
-        assert lm.forward(prompt="hello") is result
+        returned = lm.forward(prompt="hello")
 
+    assert returned is result
+    assert returned.usage == {}
     assert tracker.calls == []
 
 
@@ -113,7 +129,9 @@ def test_aforward_skips_usage_tracking_when_usage_is_none(monkeypatch):
         with dspy.context(usage_tracker=tracker):
             return await lm.aforward(prompt="hello")
 
-    assert asyncio.run(run()) is result
+    returned = asyncio.run(run())
+    assert returned is result
+    assert returned.usage == {}
     assert tracker.calls == []
 
 
@@ -271,6 +289,68 @@ def test_labeled_fewshot_demos_build_valid_codex_responses_request():
     for message in assistant_messages:
         assert message["content"]
         assert all(block["type"] != "input_text" for block in message["content"])
+
+
+def test_codex_completion_retries_empty_stream_output(monkeypatch):
+    calls = 0
+
+    def fake_responses(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return FakeResponsesStream(events=[], response=make_response())
+        return FakeResponsesStream(
+            events=[
+                SimpleNamespace(
+                    type="response.output_text.done",
+                    output_index=0,
+                    content_index=0,
+                    text="ok",
+                )
+            ],
+            response=make_response(),
+        )
+
+    monkeypatch.setattr(codex_lm.litellm, "responses", fake_responses)
+
+    response = codex_lm._codex_responses_completion(
+        {"model": "openai/gpt-5.5", "messages": [{"role": "user", "content": "hi"}]},
+        num_retries=1,
+    )
+
+    assert calls == 2
+    assert response.output[0].content[0].text == "ok"
+
+
+def test_codex_completion_retries_stream_protocol_errors(monkeypatch):
+    calls = 0
+
+    def fake_responses(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return BrokenResponsesStream()
+        return FakeResponsesStream(
+            events=[
+                SimpleNamespace(
+                    type="response.output_text.done",
+                    output_index=0,
+                    content_index=0,
+                    text="ok",
+                )
+            ],
+            response=make_response(),
+        )
+
+    monkeypatch.setattr(codex_lm.litellm, "responses", fake_responses)
+
+    response = codex_lm._codex_responses_completion(
+        {"model": "openai/gpt-5.5", "messages": [{"role": "user", "content": "hi"}]},
+        num_retries=1,
+    )
+
+    assert calls == 2
+    assert response.output[0].content[0].text == "ok"
 
 
 def test_gepa_reflection_lm_prompt_path_uses_codex_adapter(monkeypatch):

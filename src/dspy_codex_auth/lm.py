@@ -527,6 +527,19 @@ def _set_response_output(response: Any, output_items: list[Any]) -> Any:
     return response
 
 
+def _ensure_response_usage(response: Any) -> Any:
+    if _field(response, "usage") is not None:
+        return response
+
+    try:
+        response.usage = {}
+    except Exception:
+        if hasattr(response, "model_copy"):
+            return response.model_copy(update={"usage": {}})
+        response.__dict__["usage"] = {}
+    return response
+
+
 def _normalise_existing_output(response: Any) -> list[Any]:
     output_items: list[Any] = []
     for output_item in _field(response, "output", []) or []:
@@ -541,6 +554,36 @@ def _reconstruct_stream_output(response: Any, builder: _StreamOutputBuilder) -> 
     if existing_output:
         return _set_response_output(response, existing_output)
     return _set_response_output(response, builder.output_items())
+
+
+def _response_has_dspy_output(response: Any) -> bool:
+    for output_item in _field(response, "output", []) or []:
+        output_item_type = getattr(
+            _field(output_item, "type"), "value", _field(output_item, "type")
+        )
+        if output_item_type == "function_call":
+            return True
+        if output_item_type != "message":
+            continue
+        for content_item in _field(output_item, "content", []) or []:
+            text = _field(content_item, "text")
+            if isinstance(text, str) and text:
+                return True
+    return False
+
+
+def _is_retryable_stream_error(exc: Exception) -> bool:
+    text = f"{type(exc).__module__}.{type(exc).__name__}: {exc}"
+    return any(
+        marker in text
+        for marker in (
+            "RemoteProtocolError",
+            "ReadError",
+            "ConnectError",
+            "incomplete chunked read",
+            "peer closed connection",
+        )
+    )
 
 
 def _consume_codex_response_stream(response_stream: Any) -> Any:
@@ -619,14 +662,31 @@ def _codex_responses_completion(
     headers = request.pop("headers", None)
     request = _build_codex_request(request)
 
-    response_stream = litellm.responses(
-        cache=cache,
-        num_retries=num_retries,
-        retry_strategy="exponential_backoff_retry",
-        headers=_add_dspy_identifier_to_headers(headers),
-        **request,
+    max_attempts = max(1, num_retries + 1)
+    last_empty_response: Any = None
+    for attempt in range(max_attempts):
+        try:
+            response_stream = litellm.responses(
+                cache=cache,
+                num_retries=num_retries,
+                retry_strategy="exponential_backoff_retry",
+                headers=_add_dspy_identifier_to_headers(headers),
+                **request,
+            )
+            response = _consume_codex_response_stream(response_stream)
+        except Exception as exc:
+            if attempt < max_attempts - 1 and _is_retryable_stream_error(exc):
+                continue
+            raise
+
+        if _response_has_dspy_output(response):
+            return response
+        last_empty_response = response
+
+    raise RuntimeError(
+        "Codex response completed without message text or tool call "
+        f"after {max_attempts} attempt(s): {last_empty_response!r}"
     )
-    return _consume_codex_response_stream(response_stream)
 
 
 async def _acodex_responses_completion(
@@ -640,14 +700,31 @@ async def _acodex_responses_completion(
     headers = request.pop("headers", None)
     request = _build_codex_request(request)
 
-    response_stream = await litellm.aresponses(
-        cache=cache,
-        num_retries=num_retries,
-        retry_strategy="exponential_backoff_retry",
-        headers=_add_dspy_identifier_to_headers(headers),
-        **request,
+    max_attempts = max(1, num_retries + 1)
+    last_empty_response: Any = None
+    for attempt in range(max_attempts):
+        try:
+            response_stream = await litellm.aresponses(
+                cache=cache,
+                num_retries=num_retries,
+                retry_strategy="exponential_backoff_retry",
+                headers=_add_dspy_identifier_to_headers(headers),
+                **request,
+            )
+            response = await _aconsume_codex_response_stream(response_stream)
+        except Exception as exc:
+            if attempt < max_attempts - 1 and _is_retryable_stream_error(exc):
+                continue
+            raise
+
+        if _response_has_dspy_output(response):
+            return response
+        last_empty_response = response
+
+    raise RuntimeError(
+        "Codex response completed without message text or tool call "
+        f"after {max_attempts} attempt(s): {last_empty_response!r}"
     )
-    return await _aconsume_codex_response_stream(response_stream)
 
 
 class LM(_DSPY_LM):
@@ -713,6 +790,7 @@ class LM(_DSPY_LM):
             num_retries=self.num_retries,
             cache=litellm_cache_args,
         )
+        results = _ensure_response_usage(results)
 
         self._check_truncation(results)
 
@@ -720,7 +798,7 @@ class LM(_DSPY_LM):
         if (
             not getattr(results, "cache_hit", False)
             and dspy.settings.usage_tracker
-            and usage is not None
+            and usage
         ):
             dspy.settings.usage_tracker.add_usage(self.model, dict(usage))
         return results
@@ -753,6 +831,7 @@ class LM(_DSPY_LM):
             num_retries=self.num_retries,
             cache=litellm_cache_args,
         )
+        results = _ensure_response_usage(results)
 
         self._check_truncation(results)
 
@@ -760,7 +839,7 @@ class LM(_DSPY_LM):
         if (
             not getattr(results, "cache_hit", False)
             and dspy.settings.usage_tracker
-            and usage is not None
+            and usage
         ):
             dspy.settings.usage_tracker.add_usage(self.model, dict(usage))
         return results
