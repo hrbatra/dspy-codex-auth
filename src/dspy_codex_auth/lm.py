@@ -716,12 +716,13 @@ class LM(_DSPY_LM):
 
         self._check_truncation(results)
 
+        usage = getattr(results, "usage", None)
         if (
             not getattr(results, "cache_hit", False)
             and dspy.settings.usage_tracker
-            and hasattr(results, "usage")
+            and usage is not None
         ):
-            dspy.settings.usage_tracker.add_usage(self.model, dict(results.usage))
+            dspy.settings.usage_tracker.add_usage(self.model, dict(usage))
         return results
 
     async def aforward(
@@ -755,12 +756,13 @@ class LM(_DSPY_LM):
 
         self._check_truncation(results)
 
+        usage = getattr(results, "usage", None)
         if (
             not getattr(results, "cache_hit", False)
             and dspy.settings.usage_tracker
-            and hasattr(results, "usage")
+            and usage is not None
         ):
-            dspy.settings.usage_tracker.add_usage(self.model, dict(results.usage))
+            dspy.settings.usage_tracker.add_usage(self.model, dict(usage))
         return results
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import time
@@ -53,6 +54,67 @@ def make_response(output=None) -> SimpleNamespace:
     return SimpleNamespace(
         output=output or [], model="gpt-5.5", usage={}, _hidden_params={}
     )
+
+
+class FakeUsageTracker:
+    def __init__(self):
+        self.calls = []
+
+    def add_usage(self, model, usage):
+        self.calls.append((model, usage))
+
+
+def test_forward_skips_usage_tracking_when_usage_is_none(monkeypatch):
+    result = SimpleNamespace(output=[], model="gpt-5.4", usage=None, _hidden_params={})
+
+    def fake_get_cached_completion_fn(fn, cache):
+        def completion(**kwargs):
+            return result
+
+        return completion, {"no-cache": True}
+
+    lm = dspy_codex_auth.LM(
+        "openai/gpt-5.4",
+        auth_provider="codex",
+        api_key="dummy",
+        chatgpt_account_id="acct_test",
+        cache=False,
+    )
+    monkeypatch.setattr(lm, "_get_cached_completion_fn", fake_get_cached_completion_fn)
+
+    tracker = FakeUsageTracker()
+    with dspy.context(usage_tracker=tracker):
+        assert lm.forward(prompt="hello") is result
+
+    assert tracker.calls == []
+
+
+def test_aforward_skips_usage_tracking_when_usage_is_none(monkeypatch):
+    result = SimpleNamespace(output=[], model="gpt-5.4", usage=None, _hidden_params={})
+
+    def fake_get_cached_completion_fn(fn, cache):
+        async def completion(**kwargs):
+            return result
+
+        return completion, {"no-cache": True}
+
+    lm = dspy_codex_auth.LM(
+        "openai/gpt-5.4",
+        auth_provider="codex",
+        api_key="dummy",
+        chatgpt_account_id="acct_test",
+        cache=False,
+    )
+    monkeypatch.setattr(lm, "_get_cached_completion_fn", fake_get_cached_completion_fn)
+
+    tracker = FakeUsageTracker()
+
+    async def run():
+        with dspy.context(usage_tracker=tracker):
+            return await lm.aforward(prompt="hello")
+
+    assert asyncio.run(run()) is result
+    assert tracker.calls == []
 
 
 def test_install_patches_dspy_lm(tmp_path):
