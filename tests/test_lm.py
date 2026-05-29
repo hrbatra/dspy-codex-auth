@@ -64,10 +64,47 @@ class BrokenResponsesStream:
         )
 
 
+class CompletedResponseLoggingErrorStream:
+    def __init__(self):
+        self.completed_response = SimpleNamespace(response=make_response_dict())
+
+    def __iter__(self):
+        yield SimpleNamespace(
+            type="response.output_text.done",
+            output_index=0,
+            content_index=0,
+            text="hello despite logging error",
+        )
+        raise AttributeError("'dict' object has no attribute 'usage'")
+
+
+class AsyncCompletedResponseLoggingErrorStream:
+    def __init__(self):
+        self.completed_response = SimpleNamespace(response=make_response_dict())
+
+    async def __aiter__(self):
+        yield SimpleNamespace(
+            type="response.output_text.done",
+            output_index=0,
+            content_index=0,
+            text="hello despite async logging error",
+        )
+        raise AttributeError("'dict' object has no attribute 'usage'")
+
+
 def make_response(output=None) -> SimpleNamespace:
     return SimpleNamespace(
         output=output or [], model="gpt-5.5", usage={}, _hidden_params={}
     )
+
+
+def make_response_dict(output=None) -> dict:
+    return {
+        "output": output or [],
+        "model": "gpt-5.5",
+        "usage": {},
+        "_hidden_params": {},
+    }
 
 
 class FakeUsageTracker:
@@ -573,6 +610,22 @@ def test_stream_preserves_reasoning_summary():
             "text": "0.4332",
         }
     ]
+
+
+def test_stream_recovers_after_completed_response_logging_usage_shape_error():
+    stream = CompletedResponseLoggingErrorStream()
+
+    response = codex_lm._consume_codex_response_stream(stream)
+
+    assert response.output[0].content[0].text == "hello despite logging error"
+
+
+def test_async_stream_recovers_after_completed_response_logging_usage_shape_error():
+    stream = AsyncCompletedResponseLoggingErrorStream()
+
+    response = asyncio.run(codex_lm._aconsume_codex_response_stream(stream))
+
+    assert response.output[0].content[0].text == "hello despite async logging error"
 
 
 def test_non_codex_routes_fall_through(monkeypatch):

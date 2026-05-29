@@ -518,6 +518,9 @@ def _set_response_output(response: Any, output_items: list[Any]) -> Any:
     if not output_items:
         return response
 
+    if isinstance(response, dict):
+        response = SimpleNamespace(**response)
+
     try:
         response.output = output_items
     except Exception:
@@ -530,6 +533,9 @@ def _set_response_output(response: Any, output_items: list[Any]) -> Any:
 def _ensure_response_usage(response: Any) -> Any:
     if _field(response, "usage") is not None:
         return response
+
+    if isinstance(response, dict):
+        response = SimpleNamespace(**response)
 
     try:
         response.usage = {}
@@ -586,6 +592,20 @@ def _is_retryable_stream_error(exc: Exception) -> bool:
     )
 
 
+def _completed_response_from_stream(response_stream: Any) -> Any:
+    completed_event = getattr(response_stream, "completed_response", None)
+    return getattr(completed_event, "response", None)
+
+
+def _is_recoverable_completed_response_logging_error(
+    exc: Exception, response_stream: Any
+) -> bool:
+    if _completed_response_from_stream(response_stream) is None:
+        return False
+    text = f"{type(exc).__module__}.{type(exc).__name__}: {exc}"
+    return "'dict' object has no attribute 'usage'" in text
+
+
 def _consume_codex_response_stream(response_stream: Any) -> Any:
     if not hasattr(response_stream, "completed_response"):
         return response_stream
@@ -595,11 +615,16 @@ def _consume_codex_response_stream(response_stream: Any) -> Any:
         warnings.filterwarnings(
             "ignore", message="Pydantic serializer warnings:*", category=UserWarning
         )
-        for event in response_stream:
-            builder.add(event)
+        try:
+            for event in response_stream:
+                builder.add(event)
+        except Exception as exc:
+            if not _is_recoverable_completed_response_logging_error(
+                exc, response_stream
+            ):
+                raise
 
-    completed_event = getattr(response_stream, "completed_response", None)
-    completed_response = getattr(completed_event, "response", None)
+    completed_response = _completed_response_from_stream(response_stream)
     if completed_response is None:
         raise RuntimeError("Codex response stream ended without a completed response")
     return _reconstruct_stream_output(completed_response, builder)
@@ -614,11 +639,16 @@ async def _aconsume_codex_response_stream(response_stream: Any) -> Any:
         warnings.filterwarnings(
             "ignore", message="Pydantic serializer warnings:*", category=UserWarning
         )
-        async for event in response_stream:
-            builder.add(event)
+        try:
+            async for event in response_stream:
+                builder.add(event)
+        except Exception as exc:
+            if not _is_recoverable_completed_response_logging_error(
+                exc, response_stream
+            ):
+                raise
 
-    completed_event = getattr(response_stream, "completed_response", None)
-    completed_response = getattr(completed_event, "response", None)
+    completed_response = _completed_response_from_stream(response_stream)
     if completed_response is None:
         raise RuntimeError("Codex response stream ended without a completed response")
     return _reconstruct_stream_output(completed_response, builder)
