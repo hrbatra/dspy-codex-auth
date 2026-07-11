@@ -6,16 +6,19 @@ THIRD_PARTY_NOTICES.md.
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import warnings
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal, cast
 
 import dspy
 import litellm
+from litellm.types.responses.main import OutputFunctionToolCall
 
 from dspy_codex_auth.auth import (
     OPENAI_CODEX_PROVIDER,
@@ -26,17 +29,76 @@ from dspy_codex_auth.auth import (
     normalize_provider_id,
     set_default_auth_storage,
 )
+from dspy_codex_auth.responses_websocket import (
+    DEFAULT_CODEX_WEBSOCKET_CONNECT_TIMEOUT,
+    DEFAULT_CODEX_WEBSOCKET_IDLE_TIMEOUT,
+    CodexWebSocketError,
+    CodexWebSocketProtocolError,
+    CodexWebSocketResponseError,
+    WebSocketResult,
+    awebsocket_response,
+    websocket_response,
+)
 
 DEFAULT_CODEX_MODEL = "gpt-5.4"
 DEFAULT_CODEX_API_BASE = "https://chatgpt.com/backend-api/codex"
 DEFAULT_CODEX_ORIGINATOR = "dspy_codex_auth"
 DEFAULT_CODEX_INSTRUCTIONS = "You are a helpful assistant."
 
+type CodexTransport = Literal["auto", "http", "websocket"]
+
+_CODEX_TRANSPORTS = {"auto", "http", "websocket"}
+_CODEX_CACHE_CONTROL_KEY = "_dspy_codex_transport_controls"
+_CODEX_MODEL_NOT_FOUND_PREFIX = "litellm.BadRequestError: OpenAIException - "
+
 _DSPY_LM = dspy.LM
 _ORIGINAL_DSPY_LM = dspy.LM
 
 RouteResolver = Callable[[str, dict[str, Any], AuthStorage], tuple[str, dict[str, Any]]]
 _ROUTE_RESOLVERS: dict[str, RouteResolver] = {}
+
+
+def _validate_codex_transport(value: Any) -> CodexTransport:
+    if not isinstance(value, str) or value not in _CODEX_TRANSPORTS:
+        raise ValueError(
+            "codex_transport must be one of 'auto', 'http', or 'websocket'"
+        )
+    return cast(CodexTransport, value)
+
+
+def _validate_codex_websocket_timeout(name: str, value: Any) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive finite number")
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive finite number") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError(f"{name} must be a positive finite number")
+    return timeout
+
+
+def _codex_cache_request(
+    request: dict[str, Any],
+    *,
+    codex_transport: CodexTransport,
+    codex_websocket_connect_timeout: float,
+    codex_websocket_idle_timeout: float,
+) -> dict[str, Any]:
+    return {
+        **request,
+        _CODEX_CACHE_CONTROL_KEY: {
+            "transport": codex_transport,
+            "connect_timeout": codex_websocket_connect_timeout,
+            "idle_timeout": codex_websocket_idle_timeout,
+        },
+    }
+
+
+def _codex_provider_request(request: dict[str, Any]) -> dict[str, Any]:
+    provider_request = dict(request)
+    provider_request.pop(_CODEX_CACHE_CONTROL_KEY, None)
+    return provider_request
 
 
 @dataclass(frozen=True, slots=True)
@@ -396,6 +458,8 @@ def _coerce_output_item_for_dspy(output_item: Any) -> Any:
         _field(output_item, "type"), "value", _field(output_item, "type")
     )
     if output_item_type == "function_call":
+        if isinstance(output_item, dict):
+            return OutputFunctionToolCall(**output_item)
         return output_item
     if output_item_type == "reasoning":
         texts: list[str] = []
@@ -592,6 +656,54 @@ def _is_retryable_stream_error(exc: Exception) -> bool:
     )
 
 
+def _structured_litellm_error(exc: Exception) -> dict[str, Any] | None:
+    if getattr(exc, "body", None) is not None:
+        return None
+    message = getattr(exc, "message", None)
+    if not isinstance(message, str) or not message.startswith(
+        _CODEX_MODEL_NOT_FOUND_PREFIX
+    ):
+        return None
+    try:
+        payload = json.loads(message[len(_CODEX_MODEL_NOT_FOUND_PREFIX) :])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or set(payload) != {"error"}:
+        return None
+    return payload
+
+
+def _is_exact_codex_model_not_found(exc: Exception, model: str) -> bool:
+    wire_model = model.removeprefix("openai/")
+    if not isinstance(exc, litellm.BadRequestError):
+        return False
+    if getattr(exc, "status_code", None) != 404:
+        return False
+    if getattr(exc, "llm_provider", None) != "openai":
+        return False
+    if getattr(exc, "model", None) != wire_model:
+        return False
+
+    payload = _structured_litellm_error(exc)
+    if payload is None:
+        return False
+    error = payload.get("error")
+    if not isinstance(error, dict) or set(error) != {
+        "message",
+        "type",
+        "param",
+        "code",
+    }:
+        return False
+    return (
+        error.get("message") == f"Model not found {wire_model}"
+        and error.get("type") == "invalid_request_error"
+        and error.get("param") == "model"
+        and "code" in error
+        and error["code"] is None
+    )
+
+
 def _completed_response_from_stream(response_stream: Any) -> Any:
     completed_event = getattr(response_stream, "completed_response", None)
     return getattr(completed_event, "response", None)
@@ -757,6 +869,182 @@ async def _acodex_responses_completion(
     )
 
 
+def _prepare_codex_websocket_request(
+    request: dict[str, Any],
+) -> tuple[dict[str, Any], str, str, dict[str, Any]]:
+    request = dict(request)
+    request.pop("rollout_id", None)
+    headers = request.pop("headers", None)
+    api_key = request.pop("api_key", None)
+    if not isinstance(api_key, str) or not api_key:
+        raise ValueError("Codex WebSocket transport requires a non-empty api_key")
+    api_base = request.pop("api_base", DEFAULT_CODEX_API_BASE)
+    if not isinstance(api_base, str) or not api_base:
+        raise ValueError("Codex WebSocket transport requires a non-empty api_base")
+    request.pop("model_type", None)
+    request.pop("use_developer_role", None)
+
+    wire_request = {
+        key: value
+        for key, value in _build_codex_request(request).items()
+        if value is not None
+    }
+    return (
+        wire_request,
+        api_key,
+        api_base,
+        _add_dspy_identifier_to_headers(headers),
+    )
+
+
+def _consume_codex_websocket_result(result: WebSocketResult) -> Any:
+    builder = _StreamOutputBuilder()
+    for event in result.events:
+        builder.add(event)
+    return _reconstruct_stream_output(result.response, builder)
+
+
+def _is_retryable_codex_websocket_error(exc: Exception) -> bool:
+    return isinstance(exc, CodexWebSocketError) and not isinstance(
+        exc,
+        (CodexWebSocketProtocolError, CodexWebSocketResponseError),
+    )
+
+
+def _codex_websocket_completion(
+    request: dict[str, Any],
+    num_retries: int,
+    connect_timeout: float,
+    idle_timeout: float,
+) -> Any:
+    wire_request, api_key, api_base, headers = _prepare_codex_websocket_request(request)
+    max_attempts = max(1, num_retries + 1)
+    last_empty_response: Any = None
+    for attempt in range(max_attempts):
+        try:
+            result = websocket_response(
+                wire_request,
+                api_base=api_base,
+                api_key=api_key,
+                headers=headers,
+                connect_timeout=connect_timeout,
+                idle_timeout=idle_timeout,
+            )
+            response = _consume_codex_websocket_result(result)
+        except Exception as exc:
+            if attempt < max_attempts - 1 and _is_retryable_codex_websocket_error(exc):
+                continue
+            raise
+
+        if _response_has_dspy_output(response):
+            return response
+        last_empty_response = response
+
+    raise RuntimeError(
+        "Codex WebSocket response completed without message text or tool call "
+        f"after {max_attempts} attempt(s): {last_empty_response!r}"
+    )
+
+
+async def _acodex_websocket_completion(
+    request: dict[str, Any],
+    num_retries: int,
+    connect_timeout: float,
+    idle_timeout: float,
+) -> Any:
+    wire_request, api_key, api_base, headers = _prepare_codex_websocket_request(request)
+    max_attempts = max(1, num_retries + 1)
+    last_empty_response: Any = None
+    for attempt in range(max_attempts):
+        try:
+            result = await awebsocket_response(
+                wire_request,
+                api_base=api_base,
+                api_key=api_key,
+                headers=headers,
+                connect_timeout=connect_timeout,
+                idle_timeout=idle_timeout,
+            )
+            response = _consume_codex_websocket_result(result)
+        except Exception as exc:
+            if attempt < max_attempts - 1 and _is_retryable_codex_websocket_error(exc):
+                continue
+            raise
+
+        if _response_has_dspy_output(response):
+            return response
+        last_empty_response = response
+
+    raise RuntimeError(
+        "Codex WebSocket response completed without message text or tool call "
+        f"after {max_attempts} attempt(s): {last_empty_response!r}"
+    )
+
+
+def _codex_completion(
+    request: dict[str, Any],
+    num_retries: int,
+    codex_transport: CodexTransport,
+    codex_websocket_connect_timeout: float,
+    codex_websocket_idle_timeout: float,
+    cache: dict[str, Any] | None = None,
+) -> Any:
+    request = _codex_provider_request(request)
+    if codex_transport == "websocket":
+        return _codex_websocket_completion(
+            request,
+            num_retries,
+            codex_websocket_connect_timeout,
+            codex_websocket_idle_timeout,
+        )
+    if codex_transport == "http":
+        return _codex_responses_completion(request, num_retries, cache)
+
+    try:
+        return _codex_responses_completion(request, num_retries, cache)
+    except Exception as exc:
+        if not _is_exact_codex_model_not_found(exc, str(request.get("model", ""))):
+            raise
+    return _codex_websocket_completion(
+        request,
+        num_retries,
+        codex_websocket_connect_timeout,
+        codex_websocket_idle_timeout,
+    )
+
+
+async def _acodex_completion(
+    request: dict[str, Any],
+    num_retries: int,
+    codex_transport: CodexTransport,
+    codex_websocket_connect_timeout: float,
+    codex_websocket_idle_timeout: float,
+    cache: dict[str, Any] | None = None,
+) -> Any:
+    request = _codex_provider_request(request)
+    if codex_transport == "websocket":
+        return await _acodex_websocket_completion(
+            request,
+            num_retries,
+            codex_websocket_connect_timeout,
+            codex_websocket_idle_timeout,
+        )
+    if codex_transport == "http":
+        return await _acodex_responses_completion(request, num_retries, cache)
+
+    try:
+        return await _acodex_responses_completion(request, num_retries, cache)
+    except Exception as exc:
+        if not _is_exact_codex_model_not_found(exc, str(request.get("model", ""))):
+            raise
+    return await _acodex_websocket_completion(
+        request,
+        num_retries,
+        codex_websocket_connect_timeout,
+        codex_websocket_idle_timeout,
+    )
+
+
 class LM(_DSPY_LM):
     """DSPy LM with Codex subscription auth and stream compatibility fixes."""
 
@@ -766,8 +1054,22 @@ class LM(_DSPY_LM):
         *args: Any,
         auth_storage: AuthStorage | str | os.PathLike[str] | None = None,
         auth_provider: str | None = None,
+        codex_transport: Literal["auto", "http", "websocket"] = "auto",
+        codex_websocket_connect_timeout: float = (
+            DEFAULT_CODEX_WEBSOCKET_CONNECT_TIMEOUT
+        ),
+        codex_websocket_idle_timeout: float = DEFAULT_CODEX_WEBSOCKET_IDLE_TIMEOUT,
         **kwargs: Any,
     ) -> None:
+        resolved_transport = _validate_codex_transport(codex_transport)
+        resolved_connect_timeout = _validate_codex_websocket_timeout(
+            "codex_websocket_connect_timeout",
+            codex_websocket_connect_timeout,
+        )
+        resolved_idle_timeout = _validate_codex_websocket_timeout(
+            "codex_websocket_idle_timeout",
+            codex_websocket_idle_timeout,
+        )
         requested_route = normalize_provider_id(
             auth_provider if auth_provider else model.split("/", 1)[0]
         )
@@ -786,21 +1088,56 @@ class LM(_DSPY_LM):
         self.original_model_string = model
         self.auth_provider = auth_provider
         self.resolved_model_string = resolved_model
-        self._uses_codex_route = (
+        self.codex_transport = resolved_transport
+        self.codex_websocket_connect_timeout = resolved_connect_timeout
+        self.codex_websocket_idle_timeout = resolved_idle_timeout
+        uses_codex_route = (
             requested_route == OPENAI_CODEX_PROVIDER
             or resolved_kwargs.get("api_base") == DEFAULT_CODEX_API_BASE
         )
+        if not uses_codex_route and (
+            resolved_transport != "auto"
+            or resolved_connect_timeout != DEFAULT_CODEX_WEBSOCKET_CONNECT_TIMEOUT
+            or resolved_idle_timeout != DEFAULT_CODEX_WEBSOCKET_IDLE_TIMEOUT
+        ):
+            raise ValueError("Codex transport settings require a Codex LM route")
+        self._uses_codex_route = uses_codex_route
         super().__init__(resolved_model, *args, **resolved_kwargs)
 
     def forward(
         self,
         prompt: str | None = None,
         messages: list[dict[str, Any]] | None = None,
+        *,
+        codex_transport: CodexTransport | None = None,
+        codex_websocket_connect_timeout: float | None = None,
+        codex_websocket_idle_timeout: float | None = None,
         **kwargs: Any,
     ) -> Any:
         if not self._uses_codex_route:
+            if (
+                codex_transport is not None
+                or codex_websocket_connect_timeout is not None
+                or codex_websocket_idle_timeout is not None
+            ):
+                raise ValueError("Codex transport overrides require a Codex LM route")
             return super().forward(prompt=prompt, messages=messages, **kwargs)
 
+        selected_transport = _validate_codex_transport(
+            self.codex_transport if codex_transport is None else codex_transport
+        )
+        selected_connect_timeout = _validate_codex_websocket_timeout(
+            "codex_websocket_connect_timeout",
+            self.codex_websocket_connect_timeout
+            if codex_websocket_connect_timeout is None
+            else codex_websocket_connect_timeout,
+        )
+        selected_idle_timeout = _validate_codex_websocket_timeout(
+            "codex_websocket_idle_timeout",
+            self.codex_websocket_idle_timeout
+            if codex_websocket_idle_timeout is None
+            else codex_websocket_idle_timeout,
+        )
         kwargs = dict(kwargs)
         cache = kwargs.pop("cache", self.cache)
 
@@ -813,11 +1150,19 @@ class LM(_DSPY_LM):
             kwargs.pop("rollout_id", None)
 
         completion, litellm_cache_args = self._get_cached_completion_fn(
-            _codex_responses_completion, cache
+            _codex_completion, cache
         )
         results = completion(
-            request=dict(model=self.model, messages=messages, **kwargs),
+            request=_codex_cache_request(
+                dict(model=self.model, messages=messages, **kwargs),
+                codex_transport=selected_transport,
+                codex_websocket_connect_timeout=selected_connect_timeout,
+                codex_websocket_idle_timeout=selected_idle_timeout,
+            ),
             num_retries=self.num_retries,
+            codex_transport=selected_transport,
+            codex_websocket_connect_timeout=selected_connect_timeout,
+            codex_websocket_idle_timeout=selected_idle_timeout,
             cache=litellm_cache_args,
         )
         results = _ensure_response_usage(results)
@@ -837,11 +1182,36 @@ class LM(_DSPY_LM):
         self,
         prompt: str | None = None,
         messages: list[dict[str, Any]] | None = None,
+        *,
+        codex_transport: CodexTransport | None = None,
+        codex_websocket_connect_timeout: float | None = None,
+        codex_websocket_idle_timeout: float | None = None,
         **kwargs: Any,
     ) -> Any:
         if not self._uses_codex_route:
+            if (
+                codex_transport is not None
+                or codex_websocket_connect_timeout is not None
+                or codex_websocket_idle_timeout is not None
+            ):
+                raise ValueError("Codex transport overrides require a Codex LM route")
             return await super().aforward(prompt=prompt, messages=messages, **kwargs)
 
+        selected_transport = _validate_codex_transport(
+            self.codex_transport if codex_transport is None else codex_transport
+        )
+        selected_connect_timeout = _validate_codex_websocket_timeout(
+            "codex_websocket_connect_timeout",
+            self.codex_websocket_connect_timeout
+            if codex_websocket_connect_timeout is None
+            else codex_websocket_connect_timeout,
+        )
+        selected_idle_timeout = _validate_codex_websocket_timeout(
+            "codex_websocket_idle_timeout",
+            self.codex_websocket_idle_timeout
+            if codex_websocket_idle_timeout is None
+            else codex_websocket_idle_timeout,
+        )
         kwargs = dict(kwargs)
         cache = kwargs.pop("cache", self.cache)
 
@@ -854,11 +1224,19 @@ class LM(_DSPY_LM):
             kwargs.pop("rollout_id", None)
 
         completion, litellm_cache_args = self._get_cached_completion_fn(
-            _acodex_responses_completion, cache
+            _acodex_completion, cache
         )
         results = await completion(
-            request=dict(model=self.model, messages=messages, **kwargs),
+            request=_codex_cache_request(
+                dict(model=self.model, messages=messages, **kwargs),
+                codex_transport=selected_transport,
+                codex_websocket_connect_timeout=selected_connect_timeout,
+                codex_websocket_idle_timeout=selected_idle_timeout,
+            ),
             num_retries=self.num_retries,
+            codex_transport=selected_transport,
+            codex_websocket_connect_timeout=selected_connect_timeout,
+            codex_websocket_idle_timeout=selected_idle_timeout,
             cache=litellm_cache_args,
         )
         results = _ensure_response_usage(results)
@@ -901,10 +1279,13 @@ register_model_alias(("codex", "chatgpt", OPENAI_CODEX_PROVIDER), _resolve_codex
 
 
 __all__ = [
+    "CodexTransport",
     "DEFAULT_CODEX_API_BASE",
     "DEFAULT_CODEX_INSTRUCTIONS",
     "DEFAULT_CODEX_MODEL",
     "DEFAULT_CODEX_ORIGINATOR",
+    "DEFAULT_CODEX_WEBSOCKET_CONNECT_TIMEOUT",
+    "DEFAULT_CODEX_WEBSOCKET_IDLE_TIMEOUT",
     "LM",
     "RouteRegistration",
     "codex_headers",

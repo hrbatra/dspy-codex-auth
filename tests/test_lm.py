@@ -7,6 +7,7 @@ import time
 from types import SimpleNamespace
 
 import dspy
+import pytest
 
 import dspy_codex_auth
 from dspy_codex_auth.auth import AuthStorage
@@ -651,3 +652,516 @@ def test_non_codex_routes_fall_through(monkeypatch):
     )
     assert lm("hello") == ["ok"]
     assert called["prompt"] == "hello"
+
+
+def make_model_not_found_error(
+    model: str = "gpt-5.6-luna",
+    *,
+    status_code: int = 404,
+    provider: str = "openai",
+    error_message: str | None = None,
+    error_type: str = "invalid_request_error",
+    param: str = "model",
+    code=None,
+    structured: bool = True,
+    message_prefix: str = "OpenAIException - ",
+    top_level_extra: dict | None = None,
+    error_extra: dict | None = None,
+    attach_body: bool = False,
+):
+    if structured:
+        payload = {
+            "error": {
+                "message": error_message or f"Model not found {model}",
+                "type": error_type,
+                "param": param,
+                "code": code,
+            }
+        }
+        payload["error"].update(error_extra or {})
+        payload.update(top_level_extra or {})
+        message = f"{message_prefix}{json.dumps(payload)}"
+    else:
+        message = error_message or f"Model not found {model}"
+    error = codex_lm.litellm.BadRequestError(
+        message=message,
+        model=model,
+        llm_provider=provider,
+    )
+    error.status_code = status_code
+    if attach_body:
+        error.body = payload
+    return error
+
+
+def make_text_response(text: str = "ok") -> SimpleNamespace:
+    return make_response(
+        output=[
+            SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(text=text)],
+            )
+        ]
+    )
+
+
+def dispatch_kwargs(transport: str = "auto") -> dict:
+    return {
+        "request": {
+            "model": "openai/gpt-5.6-luna",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+        "num_retries": 0,
+        "codex_transport": transport,
+        "codex_websocket_connect_timeout": 10.0,
+        "codex_websocket_idle_timeout": 300.0,
+    }
+
+
+def test_codex_transport_constructor_defaults_and_validates():
+    lm = dspy_codex_auth.LM(
+        "openai/gpt-5.6-luna",
+        auth_provider="codex",
+        api_key="dummy",
+        chatgpt_account_id="acct_test",
+        cache=False,
+    )
+
+    assert lm.codex_transport == "auto"
+    assert (
+        lm.codex_websocket_connect_timeout
+        == dspy_codex_auth.DEFAULT_CODEX_WEBSOCKET_CONNECT_TIMEOUT
+    )
+    assert (
+        lm.codex_websocket_idle_timeout
+        == dspy_codex_auth.DEFAULT_CODEX_WEBSOCKET_IDLE_TIMEOUT
+    )
+
+    explicit = dspy_codex_auth.LM(
+        "openai/gpt-5.6-luna",
+        auth_provider="codex",
+        api_key="dummy",
+        chatgpt_account_id="acct_test",
+        codex_transport="websocket",
+        cache=False,
+    )
+    assert explicit.codex_transport == "websocket"
+
+    with pytest.raises(ValueError, match="auto.*http.*websocket"):
+        dspy_codex_auth.LM(
+            "openai/gpt-5.6-luna",
+            auth_provider="codex",
+            api_key="dummy",
+            chatgpt_account_id="acct_test",
+            codex_transport="invalid",
+            cache=False,
+        )
+
+
+def test_non_codex_constructor_rejects_codex_only_transport_settings():
+    with pytest.raises(ValueError, match="require a Codex LM route"):
+        dspy_codex_auth.LM(
+            "openai/test",
+            api_key="dummy",
+            api_base="http://example.invalid",
+            codex_transport="websocket",
+            cache=False,
+        )
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+def test_codex_transport_constructor_rejects_invalid_timeouts(timeout):
+    with pytest.raises(ValueError, match="positive finite"):
+        dspy_codex_auth.LM(
+            "openai/gpt-5.6-luna",
+            auth_provider="codex",
+            api_key="dummy",
+            chatgpt_account_id="acct_test",
+            codex_websocket_connect_timeout=timeout,
+            cache=False,
+        )
+
+
+def test_forward_per_call_transport_overrides_constructor_and_cache_key(monkeypatch):
+    captured_calls = []
+    lm = dspy_codex_auth.LM(
+        "openai/gpt-5.6-luna",
+        auth_provider="codex",
+        api_key="dummy",
+        chatgpt_account_id="acct_test",
+        codex_transport="websocket",
+        cache=False,
+    )
+
+    def fake_get_cached_completion_fn(fn, cache):
+        assert fn is codex_lm._codex_completion
+
+        def completion(**kwargs):
+            captured_calls.append(kwargs)
+            return make_text_response()
+
+        return completion, {"no-cache": True}
+
+    monkeypatch.setattr(lm, "_get_cached_completion_fn", fake_get_cached_completion_fn)
+
+    lm.forward(
+        prompt="first",
+        codex_transport="http",
+        codex_websocket_connect_timeout=21,
+        codex_websocket_idle_timeout=22,
+    )
+    lm.forward(prompt="second", codex_transport="websocket")
+
+    assert [call["codex_transport"] for call in captured_calls] == [
+        "http",
+        "websocket",
+    ]
+    assert captured_calls[0]["codex_websocket_connect_timeout"] == 21.0
+    assert captured_calls[0]["codex_websocket_idle_timeout"] == 22.0
+    assert "codex_transport" not in captured_calls[0]["request"]
+    assert "codex_websocket_connect_timeout" not in captured_calls[0]["request"]
+    assert "codex_websocket_idle_timeout" not in captured_calls[0]["request"]
+
+
+def test_transport_selection_produces_distinct_real_cache_entries(monkeypatch):
+    calls = []
+    http_response = make_text_response("http")
+    websocket_response = make_text_response("websocket")
+
+    def fake_http(request, num_retries, cache=None):
+        assert "_dspy_codex_transport_controls" not in request
+        calls.append(("http", None, None))
+        return http_response
+
+    def fake_websocket(request, num_retries, connect_timeout, idle_timeout):
+        assert "_dspy_codex_transport_controls" not in request
+        calls.append(("websocket", connect_timeout, idle_timeout))
+        return websocket_response
+
+    monkeypatch.setattr(codex_lm, "_codex_responses_completion", fake_http)
+    monkeypatch.setattr(codex_lm, "_codex_websocket_completion", fake_websocket)
+    lm = dspy_codex_auth.LM(
+        "openai/gpt-5.6-luna",
+        auth_provider="codex",
+        api_key="dummy",
+        chatgpt_account_id="acct_test",
+        cache=True,
+    )
+    prompt = f"cache transport probe {time.time_ns()}"
+
+    first = lm.forward(prompt=prompt, codex_transport="http")
+    second = lm.forward(prompt=prompt, codex_transport="websocket")
+    lm.forward(
+        prompt=prompt,
+        codex_transport="websocket",
+        codex_websocket_connect_timeout=11,
+    )
+    lm.forward(
+        prompt=prompt,
+        codex_transport="websocket",
+        codex_websocket_idle_timeout=301,
+    )
+
+    assert first.output[0].content[0].text == "http"
+    assert second.output[0].content[0].text == "websocket"
+    assert calls == [
+        ("http", None, None),
+        ("websocket", 10.0, 300.0),
+        ("websocket", 11.0, 300.0),
+        ("websocket", 10.0, 301.0),
+    ]
+
+
+def test_forward_rejects_invalid_per_call_transport_before_completion(monkeypatch):
+    lm = dspy_codex_auth.LM(
+        "openai/gpt-5.6-luna",
+        auth_provider="codex",
+        api_key="dummy",
+        chatgpt_account_id="acct_test",
+        cache=False,
+    )
+    monkeypatch.setattr(
+        lm,
+        "_get_cached_completion_fn",
+        lambda *_args: pytest.fail("completion must not be selected"),
+    )
+
+    with pytest.raises(ValueError, match="auto.*http.*websocket"):
+        lm.forward(prompt="hi", codex_transport="invalid")
+
+
+def test_exact_structured_model_not_found_is_detected():
+    error = make_model_not_found_error()
+
+    assert codex_lm._is_exact_codex_model_not_found(error, "openai/gpt-5.6-luna")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        make_model_not_found_error(status_code=400),
+        make_model_not_found_error(provider="azure"),
+        make_model_not_found_error(model="gpt-5.6-terra"),
+        make_model_not_found_error(error_message="Model unavailable gpt-5.6-luna"),
+        make_model_not_found_error(error_type="server_error"),
+        make_model_not_found_error(param="deployment"),
+        make_model_not_found_error(code="model_not_found"),
+        make_model_not_found_error(structured=False),
+        make_model_not_found_error(message_prefix="Proxy wrapper - "),
+        make_model_not_found_error(top_level_extra={"request_id": "req_test"}),
+        make_model_not_found_error(error_extra={"retryable": False}),
+        make_model_not_found_error(attach_body=True),
+    ],
+)
+def test_near_miss_model_errors_do_not_trigger_fallback(error):
+    assert not codex_lm._is_exact_codex_model_not_found(error, "openai/gpt-5.6-luna")
+
+
+def test_auto_transport_keeps_http_success(monkeypatch):
+    response = make_text_response("http")
+    calls = []
+
+    def fake_http(request, num_retries, cache=None):
+        calls.append("http")
+        return response
+
+    monkeypatch.setattr(codex_lm, "_codex_responses_completion", fake_http)
+    monkeypatch.setattr(
+        codex_lm,
+        "_codex_websocket_completion",
+        lambda *_args, **_kwargs: pytest.fail("websocket must not be called"),
+    )
+
+    assert codex_lm._codex_completion(**dispatch_kwargs()) is response
+    assert calls == ["http"]
+
+
+def test_auto_transport_falls_back_only_for_exact_model_not_found(monkeypatch):
+    response = make_text_response("websocket")
+    calls = []
+
+    def fake_http(request, num_retries, cache=None):
+        calls.append("http")
+        raise make_model_not_found_error()
+
+    def fake_websocket(request, num_retries, connect_timeout, idle_timeout):
+        calls.append(("websocket", connect_timeout, idle_timeout))
+        return response
+
+    monkeypatch.setattr(codex_lm, "_codex_responses_completion", fake_http)
+    monkeypatch.setattr(codex_lm, "_codex_websocket_completion", fake_websocket)
+
+    assert codex_lm._codex_completion(**dispatch_kwargs()) is response
+    assert calls == ["http", ("websocket", 10.0, 300.0)]
+
+
+def test_auto_transport_propagates_near_miss_without_websocket(monkeypatch):
+    error = make_model_not_found_error(param="deployment")
+
+    def fake_http(request, num_retries, cache=None):
+        raise error
+
+    monkeypatch.setattr(codex_lm, "_codex_responses_completion", fake_http)
+    monkeypatch.setattr(
+        codex_lm,
+        "_codex_websocket_completion",
+        lambda *_args, **_kwargs: pytest.fail("websocket must not be called"),
+    )
+
+    with pytest.raises(codex_lm.litellm.BadRequestError) as caught:
+        codex_lm._codex_completion(**dispatch_kwargs())
+    assert caught.value is error
+
+
+def test_explicit_http_never_falls_back(monkeypatch):
+    error = make_model_not_found_error()
+
+    def fake_http(request, num_retries, cache=None):
+        raise error
+
+    monkeypatch.setattr(codex_lm, "_codex_responses_completion", fake_http)
+    monkeypatch.setattr(
+        codex_lm,
+        "_codex_websocket_completion",
+        lambda *_args, **_kwargs: pytest.fail("websocket must not be called"),
+    )
+
+    with pytest.raises(codex_lm.litellm.BadRequestError) as caught:
+        codex_lm._codex_completion(**dispatch_kwargs("http"))
+    assert caught.value is error
+
+
+def test_explicit_websocket_bypasses_http(monkeypatch):
+    response = make_text_response("websocket")
+    monkeypatch.setattr(
+        codex_lm,
+        "_codex_responses_completion",
+        lambda *_args, **_kwargs: pytest.fail("http must not be called"),
+    )
+    monkeypatch.setattr(
+        codex_lm,
+        "_codex_websocket_completion",
+        lambda *_args, **_kwargs: response,
+    )
+
+    assert codex_lm._codex_completion(**dispatch_kwargs("websocket")) is response
+
+
+def test_async_auto_transport_falls_back_for_exact_model_not_found(monkeypatch):
+    response = make_text_response("websocket")
+    calls = []
+
+    async def fake_http(request, num_retries, cache=None):
+        calls.append("http")
+        raise make_model_not_found_error()
+
+    async def fake_websocket(request, num_retries, connect_timeout, idle_timeout):
+        calls.append("websocket")
+        return response
+
+    monkeypatch.setattr(codex_lm, "_acodex_responses_completion", fake_http)
+    monkeypatch.setattr(codex_lm, "_acodex_websocket_completion", fake_websocket)
+
+    returned = asyncio.run(codex_lm._acodex_completion(**dispatch_kwargs()))
+    assert returned is response
+    assert calls == ["http", "websocket"]
+
+
+def test_websocket_completion_builds_wire_request_and_reconstructs_events(monkeypatch):
+    captured = {}
+
+    def fake_websocket_response(request, **kwargs):
+        captured["request"] = request
+        captured.update(kwargs)
+        return codex_lm.WebSocketResult(
+            events=[
+                {
+                    "type": "response.output_text.done",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": "from websocket",
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "status": "completed",
+                        "model": "gpt-5.6-luna",
+                        "output": [],
+                    },
+                },
+            ],
+            response={
+                "status": "completed",
+                "model": "gpt-5.6-luna",
+                "output": [],
+                "usage": {},
+            },
+        )
+
+    monkeypatch.setattr(codex_lm, "websocket_response", fake_websocket_response)
+
+    response = codex_lm._codex_websocket_completion(
+        {
+            "model": "openai/gpt-5.6-luna",
+            "messages": [{"role": "user", "content": "hi"}],
+            "api_key": "secret-token",
+            "api_base": "https://chatgpt.com/backend-api/codex",
+            "headers": {"chatgpt-account-id": "acct_test"},
+            "model_type": "responses",
+            "use_developer_role": True,
+            "temperature": None,
+        },
+        num_retries=0,
+        connect_timeout=10.0,
+        idle_timeout=300.0,
+    )
+
+    assert response.output[0].content[0].text == "from websocket"
+    assert captured["api_key"] == "secret-token"
+    assert captured["api_base"] == "https://chatgpt.com/backend-api/codex"
+    assert captured["headers"]["User-Agent"].startswith("DSPy/")
+    assert captured["request"]["model"] == "openai/gpt-5.6-luna"
+    assert captured["request"]["stream"] is True
+    assert captured["request"]["store"] is False
+    assert all(value is not None for value in captured["request"].values())
+    for client_key in (
+        "api_key",
+        "api_base",
+        "headers",
+        "model_type",
+        "use_developer_role",
+    ):
+        assert client_key not in captured["request"]
+
+
+@pytest.mark.parametrize("function_call_source", ["terminal", "event"])
+def test_websocket_function_calls_are_compatible_with_dspy_processing(
+    monkeypatch,
+    function_call_source,
+):
+    function_call = {
+        "type": "function_call",
+        "id": "fc_test",
+        "call_id": "call_test",
+        "name": "lookup_weather",
+        "arguments": '{"city":"Chicago"}',
+        "status": "completed",
+    }
+    terminal_output = [function_call] if function_call_source == "terminal" else []
+    events = []
+    if function_call_source == "event":
+        events.append(
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": function_call,
+            }
+        )
+    events.append(
+        {
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "model": "gpt-5.6-luna",
+                "output": terminal_output,
+            },
+        }
+    )
+
+    monkeypatch.setattr(
+        codex_lm,
+        "websocket_response",
+        lambda *_args, **_kwargs: codex_lm.WebSocketResult(
+            events=events,
+            response={
+                "status": "completed",
+                "model": "gpt-5.6-luna",
+                "output": terminal_output,
+                "usage": {},
+            },
+        ),
+    )
+    response = codex_lm._codex_websocket_completion(
+        {
+            "model": "openai/gpt-5.6-luna",
+            "messages": [{"role": "user", "content": "hi"}],
+            "api_key": "secret-token",
+            "api_base": "https://chatgpt.com/backend-api/codex",
+            "headers": {"chatgpt-account-id": "acct_test"},
+        },
+        num_retries=0,
+        connect_timeout=10.0,
+        idle_timeout=300.0,
+    )
+    lm = dspy_codex_auth.LM(
+        "openai/gpt-5.6-luna",
+        auth_provider="codex",
+        api_key="dummy",
+        chatgpt_account_id="acct_test",
+        cache=False,
+    )
+
+    processed = lm._process_response(response)
+
+    assert processed[0]["tool_calls"][0]["call_id"] == "call_test"
+    assert processed[0]["tool_calls"][0]["name"] == "lookup_weather"

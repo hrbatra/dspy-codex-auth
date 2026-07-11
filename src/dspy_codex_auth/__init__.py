@@ -24,6 +24,9 @@ from dspy_codex_auth.auth import (
 )
 
 from dspy_codex_auth.lm import (
+    DEFAULT_CODEX_WEBSOCKET_CONNECT_TIMEOUT,
+    DEFAULT_CODEX_WEBSOCKET_IDLE_TIMEOUT,
+    CodexTransport,
     DEFAULT_CODEX_API_BASE,
     DEFAULT_CODEX_INSTRUCTIONS,
     DEFAULT_CODEX_MODEL,
@@ -38,10 +41,13 @@ from dspy_codex_auth.lm import (
 )
 
 __all__ = [
+    "CodexTransport",
     "DEFAULT_CODEX_API_BASE",
     "DEFAULT_CODEX_INSTRUCTIONS",
     "DEFAULT_CODEX_MODEL",
     "DEFAULT_CODEX_ORIGINATOR",
+    "DEFAULT_CODEX_WEBSOCKET_CONNECT_TIMEOUT",
+    "DEFAULT_CODEX_WEBSOCKET_IDLE_TIMEOUT",
     "OPENAI_CODEX_PROVIDER",
     "ApiKeyCredential",
     "AuthStorage",
