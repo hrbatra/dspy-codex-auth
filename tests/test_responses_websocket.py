@@ -11,6 +11,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
+import dspy
 
 
 MODULE_NAME = "dspy_codex_auth.responses_websocket"
@@ -156,11 +157,16 @@ def test_sync_client_sends_secure_response_create_and_collects_events(
     monkeypatch.setattr(websocket_module, "ConnectionClosed", FakeConnectionClosed)
     headers = {
         "Authorization": "Bearer caller-value",
+        "aUtHoRiZaTiOn": "Bearer mixed-case-caller-value",
         "chatgpt-account-id": "acct_test",
         "OpenAI-Beta": "responses=experimental",
+        "oPeNaI-bEtA": "mixed-case-beta",
         "originator": "dspy_codex_auth",
+        "ORIGINATOR": "mixed-case-originator",
         "User-Agent": "DSPy/3.2.0",
+        "user-agent": "spoofed-agent",
         "x-client-request-id": "caller-request-id",
+        "X-CLIENT-REQUEST-ID": "mixed-case-request-id",
         "X-Test": "preserved",
     }
     original_headers = dict(headers)
@@ -180,7 +186,6 @@ def test_sync_client_sends_secure_response_create_and_collects_events(
     assert isinstance(connect_call["ssl"], ssl.SSLContext)
     assert connect_call["open_timeout"] == 12.0
     assert connect_call["user_agent_header"] is None
-    assert connect_call["max_size"] == 16 * 1024 * 1024
     handshake_headers = connect_call["additional_headers"]
     assert handshake_headers["Authorization"] == "Bearer secret-token"
     assert handshake_headers["chatgpt-account-id"] == "acct_test"
@@ -192,7 +197,12 @@ def test_sync_client_sends_secure_response_create_and_collects_events(
         handshake_headers["originator"]
         == websocket_module.DEFAULT_CODEX_WEBSOCKET_ORIGINATOR
     )
-    assert handshake_headers["User-Agent"] == "DSPy/3.2.0"
+    assert handshake_headers["User-Agent"] == f"DSPy/{dspy.__version__}"
+    assert sum(key.lower() == "user-agent" for key in handshake_headers) == 1
+    assert sum(key.lower() == "authorization" for key in handshake_headers) == 1
+    assert sum(key.lower() == "openai-beta" for key in handshake_headers) == 1
+    assert sum(key.lower() == "originator" for key in handshake_headers) == 1
+    assert sum(key.lower() == "x-client-request-id" for key in handshake_headers) == 1
     assert handshake_headers["X-Test"] == "preserved"
     assert handshake_headers["x-client-request-id"] != "caller-request-id"
     assert handshake_headers["session-id"]
@@ -295,6 +305,33 @@ def test_client_rejects_api_key_in_data_frame(
     assert called is False
 
 
+def test_client_rejects_nested_bearer_token_in_data_frame(
+    websocket_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+):
+    called = False
+
+    def fake_connect(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(websocket_module, "_sync_connect", fake_connect)
+    request = _request()
+    request["input"][0]["content"][0]["text"] = "leaked secret-token"
+
+    with pytest.raises(ValueError, match="bearer credential") as caught:
+        websocket_module.websocket_response(
+            request,
+            api_base="https://chatgpt.com/backend-api/codex",
+            api_key="secret-token",
+            headers={"User-Agent": "DSPy/3.2.0"},
+        )
+
+    assert "secret-token" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert called is False
+
+
 def test_server_error_is_typed_structured_and_token_redacted(
     websocket_module: ModuleType, monkeypatch: pytest.MonkeyPatch
 ):
@@ -305,7 +342,7 @@ def test_server_error_is_typed_structured_and_token_redacted(
             "message": "Model not found secret-token",
             "type": "invalid_request_error",
             "param": "model",
-            "code": "secret-token-code",
+            "code": {"unsafe": "secret-token-code"},
         },
     }
     connection = FakeSyncConnection([json.dumps(event)])
@@ -323,8 +360,10 @@ def test_server_error_is_typed_structured_and_token_redacted(
     assert error.status_code == 404
     assert error.error_type == "invalid_request_error"
     assert error.param == "model"
-    assert error.code == "<redacted>-code"
+    assert error.code == "{'unsafe': '<redacted>-code'}"
     assert "secret-token" not in str(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None
 
 
 @pytest.mark.parametrize(
@@ -333,6 +372,33 @@ def test_server_error_is_typed_structured_and_token_redacted(
         ("not json", "valid JSON"),
         (b"binary", "binary"),
         (json.dumps({"type": "response.completed", "response": None}), "response"),
+        (json.dumps({"type": "response.completed", "response": {}}), "status"),
+        (
+            json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "status": "failed",
+                        "model": "gpt-5.6-luna",
+                        "output": [],
+                    },
+                }
+            ),
+            "status",
+        ),
+        (
+            json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "status": "completed",
+                        "model": "gpt-5.6-luna",
+                        "output": {},
+                    },
+                }
+            ),
+            "output",
+        ),
     ],
 )
 def test_invalid_frames_raise_protocol_error(
@@ -351,6 +417,25 @@ def test_invalid_frames_raise_protocol_error(
             api_key="secret-token",
             headers={"User-Agent": "DSPy/3.2.0"},
         )
+
+
+def test_malformed_frame_does_not_survive_in_exception_graph(
+    websocket_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+):
+    connection = FakeSyncConnection(["not-json secret-token"])
+    monkeypatch.setattr(websocket_module, "_sync_connect", lambda *_a, **_k: connection)
+
+    with pytest.raises(websocket_module.CodexWebSocketProtocolError) as caught:
+        websocket_module.websocket_response(
+            _request(),
+            api_base="https://chatgpt.com/backend-api/codex",
+            api_key="secret-token",
+            headers={"User-Agent": "DSPy/3.2.0"},
+        )
+
+    assert "secret-token" not in repr(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 def test_close_before_completed_raises_protocol_error(
@@ -381,7 +466,7 @@ def test_sync_idle_timeout_raises_typed_timeout(
     with pytest.raises(
         websocket_module.CodexWebSocketTimeoutError,
         match="30.0 seconds",
-    ):
+    ) as caught:
         websocket_module.websocket_response(
             _request(),
             api_base="https://chatgpt.com/backend-api/codex",
@@ -389,6 +474,30 @@ def test_sync_idle_timeout_raises_typed_timeout(
             headers={"User-Agent": "DSPy/3.2.0"},
             idle_timeout=30.0,
         )
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_connection_failure_does_not_retain_secret_exception(
+    websocket_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+):
+    def fake_connect(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("connection failed with secret-token")
+
+    monkeypatch.setattr(websocket_module, "_sync_connect", fake_connect)
+
+    with pytest.raises(websocket_module.CodexWebSocketError) as caught:
+        websocket_module.websocket_response(
+            _request(),
+            api_base="https://chatgpt.com/backend-api/codex",
+            api_key="secret-token",
+            headers={"User-Agent": "DSPy/3.2.0"},
+        )
+
+    assert str(caught.value) == "Codex WebSocket connection failed"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 def test_async_server_error_uses_same_typed_error(
@@ -426,6 +535,97 @@ def test_async_server_error_uses_same_typed_error(
 
     assert caught.value.status_code == 429
     assert caught.value.code == "rate_limit_exceeded"
+
+
+@pytest.mark.parametrize("frame", ["not json", b"binary"])
+def test_async_invalid_frames_raise_protocol_error(
+    websocket_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    frame: str | bytes,
+):
+    connection = FakeAsyncConnection([frame])
+    monkeypatch.setattr(
+        websocket_module, "_async_connect", lambda *_a, **_k: connection
+    )
+
+    with pytest.raises(websocket_module.CodexWebSocketProtocolError):
+        asyncio.run(
+            websocket_module.awebsocket_response(
+                _request(),
+                api_base="https://chatgpt.com/backend-api/codex",
+                api_key="secret-token",
+                headers={"User-Agent": "DSPy/3.2.0"},
+            )
+        )
+
+
+def test_async_close_before_completed_raises_protocol_error(
+    websocket_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+):
+    connection = FakeAsyncConnection([])
+    monkeypatch.setattr(
+        websocket_module, "_async_connect", lambda *_a, **_k: connection
+    )
+    monkeypatch.setattr(websocket_module, "ConnectionClosed", FakeConnectionClosed)
+
+    with pytest.raises(
+        websocket_module.CodexWebSocketProtocolError,
+        match="before response.completed",
+    ):
+        asyncio.run(
+            websocket_module.awebsocket_response(
+                _request(),
+                api_base="https://chatgpt.com/backend-api/codex",
+                api_key="secret-token",
+                headers={"User-Agent": "DSPy/3.2.0"},
+            )
+        )
+
+
+def test_async_idle_timeout_raises_typed_timeout(
+    websocket_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+):
+    class SlowAsyncConnection(FakeAsyncConnection):
+        async def recv(self) -> str | bytes:
+            await asyncio.sleep(0.05)
+            return json.dumps(_completed_event())
+
+    connection = SlowAsyncConnection([])
+    monkeypatch.setattr(
+        websocket_module, "_async_connect", lambda *_a, **_k: connection
+    )
+
+    with pytest.raises(websocket_module.CodexWebSocketTimeoutError) as caught:
+        asyncio.run(
+            websocket_module.awebsocket_response(
+                _request(),
+                api_base="https://chatgpt.com/backend-api/codex",
+                api_key="secret-token",
+                headers={"User-Agent": "DSPy/3.2.0"},
+                idle_timeout=0.001,
+            )
+        )
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_non_openai_provider_prefix_is_preserved(
+    websocket_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+):
+    connection = FakeSyncConnection([json.dumps(_completed_event())])
+    monkeypatch.setattr(websocket_module, "_sync_connect", lambda *_a, **_k: connection)
+    request = _request()
+    request["model"] = "other/openai/gpt-test"
+
+    websocket_module.websocket_response(
+        request,
+        api_base="https://chatgpt.com/backend-api/codex",
+        api_key="secret-token",
+        headers={"User-Agent": "DSPy/3.2.0"},
+    )
+
+    assert json.loads(connection.sent[0])["model"] == "other/openai/gpt-test"
 
 
 @pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])

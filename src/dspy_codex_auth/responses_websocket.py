@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+import dspy
 import requests
 from websockets.asyncio.client import connect as _async_connect
 from websockets.exceptions import ConnectionClosed
@@ -22,16 +23,13 @@ DEFAULT_CODEX_WEBSOCKET_ORIGINATOR = "codex_cli_rs"
 DEFAULT_CODEX_WEBSOCKET_CONNECT_TIMEOUT = 10.0
 DEFAULT_CODEX_WEBSOCKET_IDLE_TIMEOUT = 300.0
 
-_CLOSE_TIMEOUT = 5.0
-_MAX_MESSAGE_SIZE = 16 * 1024 * 1024
-_PING_INTERVAL = 20.0
-_PING_TIMEOUT = 20.0
 _PROTECTED_HEADER_NAMES = {
     "authorization",
     "openai-beta",
     "originator",
     "session-id",
     "thread-id",
+    "user-agent",
     "x-client-request-id",
 }
 
@@ -127,6 +125,7 @@ def _handshake_headers(
             "Authorization": f"Bearer {api_key}",
             "OpenAI-Beta": DEFAULT_CODEX_WEBSOCKET_BETA,
             "originator": DEFAULT_CODEX_WEBSOCKET_ORIGINATOR,
+            "User-Agent": f"DSPy/{dspy.__version__}",
             "x-client-request-id": request_id,
             "session-id": session_id,
             "thread-id": request_id,
@@ -135,9 +134,26 @@ def _handshake_headers(
     return handshake_headers
 
 
-def _serialize_request(request: dict[str, Any]) -> str:
+def _contains_secret(value: Any, secret: str) -> bool:
+    if not secret:
+        return False
+    if isinstance(value, str):
+        return secret in value
+    if isinstance(value, Mapping):
+        return any(
+            _contains_secret(key, secret) or _contains_secret(item, secret)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_secret(item, secret) for item in value)
+    return False
+
+
+def _serialize_request(request: dict[str, Any], *, api_key: str) -> str:
     if "api_key" in request:
         raise ValueError("api_key must not appear in a WebSocket request frame")
+    if _contains_secret(request, api_key):
+        raise ValueError("bearer credential must not appear in a WebSocket frame")
 
     payload = dict(request)
     model = payload.get("model")
@@ -146,25 +162,36 @@ def _serialize_request(request: dict[str, Any]) -> str:
     if model.startswith("openai/"):
         payload["model"] = model.removeprefix("openai/")
     payload["type"] = "response.create"
-    return json.dumps(payload, separators=(",", ":"))
+    frame = json.dumps(payload, separators=(",", ":"))
+    if api_key and api_key in frame:
+        raise ValueError("bearer credential must not appear in a WebSocket frame")
+    return frame
 
 
-def _decode_event(raw_message: str | bytes) -> dict[str, Any]:
+def _decode_event(raw_message: str | bytes, *, api_key: str) -> dict[str, Any]:
     if not isinstance(raw_message, str):
         raise CodexWebSocketProtocolError(
             "Codex WebSocket returned an unexpected binary frame"
         )
+    invalid_json = False
     try:
         event = json.loads(raw_message)
-    except json.JSONDecodeError as exc:
+    except json.JSONDecodeError:
+        invalid_json = True
+        event = None
+    if invalid_json:
         raise CodexWebSocketProtocolError(
             "Codex WebSocket frame must contain valid JSON"
-        ) from exc
+        )
     if not isinstance(event, dict):
         raise CodexWebSocketProtocolError("Codex WebSocket event must be a JSON object")
     if not isinstance(event.get("type"), str):
         raise CodexWebSocketProtocolError(
             "Codex WebSocket event must include a string type"
+        )
+    if event["type"] != "error" and _contains_secret(event, api_key):
+        raise CodexWebSocketProtocolError(
+            "Codex WebSocket event contained the bearer credential"
         )
     return event
 
@@ -198,7 +225,7 @@ def _raise_response_error(event: dict[str, Any], *, api_key: str) -> None:
         if isinstance(error_type, str)
         else None,
         param=_redact(param, api_key) if isinstance(param, str) else None,
-        code=_redact(code, api_key) if isinstance(code, str) else code,
+        code=_redact(code, api_key) if code is not None else None,
     )
 
 
@@ -218,6 +245,19 @@ def _terminal_response(
         raise CodexWebSocketProtocolError(
             "response.completed must include a response object"
         )
+    if response.get("status") != "completed":
+        raise CodexWebSocketProtocolError(
+            "response.completed response status must be completed"
+        )
+    model = response.get("model")
+    if not isinstance(model, str) or not model:
+        raise CodexWebSocketProtocolError(
+            "response.completed response model must be a non-empty string"
+        )
+    if not isinstance(response.get("output"), list):
+        raise CodexWebSocketProtocolError(
+            "response.completed response output must be a list"
+        )
     return response
 
 
@@ -235,11 +275,110 @@ def _connection_options(
         "additional_headers": headers,
         "user_agent_header": None,
         "open_timeout": connect_timeout,
-        "close_timeout": _CLOSE_TIMEOUT,
-        "ping_interval": _PING_INTERVAL,
-        "ping_timeout": _PING_TIMEOUT,
-        "max_size": _MAX_MESSAGE_SIZE,
     }
+
+
+def _receive_sync_event(
+    connection: Any,
+    *,
+    idle_timeout: float,
+    api_key: str,
+) -> dict[str, Any]:
+    timed_out = False
+    closed = False
+    try:
+        raw_message = connection.recv(timeout=idle_timeout)
+    except TimeoutError:
+        timed_out = True
+        raw_message = None
+    except ConnectionClosed:
+        closed = True
+        raw_message = None
+
+    if timed_out:
+        raise CodexWebSocketTimeoutError(
+            f"Codex WebSocket received no event for {idle_timeout} seconds"
+        )
+    if closed:
+        raise CodexWebSocketProtocolError(
+            "Codex WebSocket closed before response.completed"
+        )
+    return _decode_event(raw_message, api_key=api_key)
+
+
+async def _receive_async_event(
+    connection: Any,
+    *,
+    idle_timeout: float,
+    api_key: str,
+) -> dict[str, Any]:
+    timed_out = False
+    closed = False
+    try:
+        async with asyncio.timeout(idle_timeout):
+            raw_message = await connection.recv()
+    except TimeoutError:
+        timed_out = True
+        raw_message = None
+    except ConnectionClosed:
+        closed = True
+        raw_message = None
+
+    if timed_out:
+        raise CodexWebSocketTimeoutError(
+            f"Codex WebSocket received no event for {idle_timeout} seconds"
+        )
+    if closed:
+        raise CodexWebSocketProtocolError(
+            "Codex WebSocket closed before response.completed"
+        )
+    return _decode_event(raw_message, api_key=api_key)
+
+
+def _sync_response(
+    websocket_url: str,
+    *,
+    options: dict[str, Any],
+    frame: str,
+    idle_timeout: float,
+    api_key: str,
+) -> WebSocketResult:
+    events: list[dict[str, Any]] = []
+    with _sync_connect(websocket_url, **options) as connection:
+        connection.send(frame)
+        while True:
+            event = _receive_sync_event(
+                connection,
+                idle_timeout=idle_timeout,
+                api_key=api_key,
+            )
+            events.append(event)
+            response = _terminal_response(event, api_key=api_key)
+            if response is not None:
+                return WebSocketResult(events=events, response=response)
+
+
+async def _async_response(
+    websocket_url: str,
+    *,
+    options: dict[str, Any],
+    frame: str,
+    idle_timeout: float,
+    api_key: str,
+) -> WebSocketResult:
+    events: list[dict[str, Any]] = []
+    async with _async_connect(websocket_url, **options) as connection:
+        await connection.send(frame)
+        while True:
+            event = await _receive_async_event(
+                connection,
+                idle_timeout=idle_timeout,
+                api_key=api_key,
+            )
+            events.append(event)
+            response = _terminal_response(event, api_key=api_key)
+            if response is not None:
+                return WebSocketResult(events=events, response=response)
 
 
 def websocket_response(
@@ -254,8 +393,10 @@ def websocket_response(
     """Send one synchronous Codex Responses request over WebSocket."""
     connect_timeout = _validate_timeout("connect_timeout", connect_timeout)
     idle_timeout = _validate_timeout("idle_timeout", idle_timeout)
+    if not api_key:
+        raise ValueError("api_key must be a non-empty string")
     websocket_url = codex_websocket_url(api_base)
-    frame = _serialize_request(request)
+    frame = _serialize_request(request, api_key=api_key)
     handshake_headers = _handshake_headers(headers, api_key=api_key)
     options = _connection_options(
         websocket_url,
@@ -263,35 +404,30 @@ def websocket_response(
         connect_timeout=connect_timeout,
     )
 
-    events: list[dict[str, Any]] = []
+    connect_timed_out = False
+    connection_failed = False
     try:
-        with _sync_connect(websocket_url, **options) as connection:
-            connection.send(frame)
-            while True:
-                try:
-                    raw_message = connection.recv(timeout=idle_timeout)
-                except TimeoutError as exc:
-                    raise CodexWebSocketTimeoutError(
-                        f"Codex WebSocket received no event for {idle_timeout} seconds"
-                    ) from exc
-                except ConnectionClosed as exc:
-                    raise CodexWebSocketProtocolError(
-                        "Codex WebSocket closed before response.completed"
-                    ) from exc
-
-                event = _decode_event(raw_message)
-                events.append(event)
-                response = _terminal_response(event, api_key=api_key)
-                if response is not None:
-                    return WebSocketResult(events=events, response=response)
+        return _sync_response(
+            websocket_url,
+            options=options,
+            frame=frame,
+            idle_timeout=idle_timeout,
+            api_key=api_key,
+        )
     except CodexWebSocketError:
         raise
-    except TimeoutError as exc:
+    except TimeoutError:
+        connect_timed_out = True
+    except Exception:
+        connection_failed = True
+
+    if connect_timed_out:
         raise CodexWebSocketTimeoutError(
             f"Codex WebSocket connection exceeded {connect_timeout} seconds"
-        ) from exc
-    except Exception as exc:
-        raise CodexWebSocketError("Codex WebSocket connection failed") from exc
+        )
+    if connection_failed:
+        raise CodexWebSocketError("Codex WebSocket connection failed")
+    raise AssertionError("unreachable")
 
 
 async def awebsocket_response(
@@ -306,8 +442,10 @@ async def awebsocket_response(
     """Send one asynchronous Codex Responses request over WebSocket."""
     connect_timeout = _validate_timeout("connect_timeout", connect_timeout)
     idle_timeout = _validate_timeout("idle_timeout", idle_timeout)
+    if not api_key:
+        raise ValueError("api_key must be a non-empty string")
     websocket_url = codex_websocket_url(api_base)
-    frame = _serialize_request(request)
+    frame = _serialize_request(request, api_key=api_key)
     handshake_headers = _handshake_headers(headers, api_key=api_key)
     options = _connection_options(
         websocket_url,
@@ -315,36 +453,30 @@ async def awebsocket_response(
         connect_timeout=connect_timeout,
     )
 
-    events: list[dict[str, Any]] = []
+    connect_timed_out = False
+    connection_failed = False
     try:
-        async with _async_connect(websocket_url, **options) as connection:
-            await connection.send(frame)
-            while True:
-                try:
-                    async with asyncio.timeout(idle_timeout):
-                        raw_message = await connection.recv()
-                except TimeoutError as exc:
-                    raise CodexWebSocketTimeoutError(
-                        f"Codex WebSocket received no event for {idle_timeout} seconds"
-                    ) from exc
-                except ConnectionClosed as exc:
-                    raise CodexWebSocketProtocolError(
-                        "Codex WebSocket closed before response.completed"
-                    ) from exc
-
-                event = _decode_event(raw_message)
-                events.append(event)
-                response = _terminal_response(event, api_key=api_key)
-                if response is not None:
-                    return WebSocketResult(events=events, response=response)
+        return await _async_response(
+            websocket_url,
+            options=options,
+            frame=frame,
+            idle_timeout=idle_timeout,
+            api_key=api_key,
+        )
     except CodexWebSocketError:
         raise
-    except TimeoutError as exc:
+    except TimeoutError:
+        connect_timed_out = True
+    except Exception:
+        connection_failed = True
+
+    if connect_timed_out:
         raise CodexWebSocketTimeoutError(
             f"Codex WebSocket connection exceeded {connect_timeout} seconds"
-        ) from exc
-    except Exception as exc:
-        raise CodexWebSocketError("Codex WebSocket connection failed") from exc
+        )
+    if connection_failed:
+        raise CodexWebSocketError("Codex WebSocket connection failed")
+    raise AssertionError("unreachable")
 
 
 __all__ = [
