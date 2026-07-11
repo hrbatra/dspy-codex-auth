@@ -7,11 +7,13 @@ import time
 from types import SimpleNamespace
 
 import dspy
+import httpx
 import pytest
 
 import dspy_codex_auth
-from dspy_codex_auth.auth import AuthStorage
 import dspy_codex_auth.lm as codex_lm
+import dspy_codex_auth.responses_websocket as websocket_module
+from dspy_codex_auth.auth import AuthStorage
 
 
 def _b64url(data: dict) -> str:
@@ -1092,6 +1094,193 @@ def test_websocket_completion_builds_wire_request_and_reconstructs_events(monkey
         "use_developer_role",
     ):
         assert client_key not in captured["request"]
+
+
+def test_websocket_timeout_is_not_serialized_and_overrides_idle_timeout(monkeypatch):
+    class FakeConnection:
+        def __init__(self):
+            self.sent = []
+            self.recv_timeouts = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def send(self, frame):
+            self.sent.append(frame)
+
+        def recv(self, timeout=None):
+            self.recv_timeouts.append(timeout)
+            return json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "status": "completed",
+                        "model": "gpt-5.6-luna",
+                        "output": [
+                            {
+                                "type": "message",
+                                "content": [{"type": "output_text", "text": "ok"}],
+                            }
+                        ],
+                        "usage": {},
+                    },
+                }
+            )
+
+    connection = FakeConnection()
+    monkeypatch.setattr(
+        websocket_module,
+        "_sync_connect",
+        lambda *_args, **_kwargs: connection,
+    )
+
+    lm = dspy_codex_auth.LM(
+        "openai/gpt-5.6-luna",
+        auth_provider="codex",
+        api_key="secret-token",
+        chatgpt_account_id="acct_test",
+        codex_transport="websocket",
+        cache=False,
+    )
+    lm.forward(prompt="hi", timeout=600)
+
+    wire_request = json.loads(connection.sent[0])
+    assert "timeout" not in wire_request
+    assert connection.recv_timeouts == [600.0]
+
+
+def test_per_call_websocket_idle_timeout_overrides_constructor_timeout(monkeypatch):
+    captured = {}
+
+    def fake_websocket_response(request, **kwargs):
+        captured.update(kwargs)
+        return codex_lm.WebSocketResult(
+            events=[],
+            response={
+                "status": "completed",
+                "model": "gpt-5.6-luna",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "ok"}],
+                    }
+                ],
+                "usage": {},
+            },
+        )
+
+    monkeypatch.setattr(codex_lm, "websocket_response", fake_websocket_response)
+    lm = dspy_codex_auth.LM(
+        "openai/gpt-5.6-luna",
+        auth_provider="codex",
+        api_key="secret-token",
+        chatgpt_account_id="acct_test",
+        codex_transport="websocket",
+        timeout=600,
+        cache=False,
+    )
+
+    lm.forward(prompt="hi", codex_websocket_idle_timeout=22)
+
+    assert captured["idle_timeout"] == 22.0
+
+
+def test_websocket_strips_explicit_client_transport_kwargs(monkeypatch):
+    captured = {}
+
+    def fake_websocket_response(request, **kwargs):
+        captured["request"] = request
+        return codex_lm.WebSocketResult(
+            events=[],
+            response={
+                "status": "completed",
+                "model": "gpt-5.6-luna",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "ok"}],
+                    }
+                ],
+                "usage": {},
+            },
+        )
+
+    monkeypatch.setattr(codex_lm, "websocket_response", fake_websocket_response)
+    client_transport_kwargs = {
+        "timeout": 600,
+        "request_timeout": 601,
+        "stream_timeout": 602,
+        "connect_timeout": 603,
+        "read_timeout": 604,
+        "write_timeout": 605,
+        "pool_timeout": 606,
+        "num_retries": 2,
+        "max_retries": 3,
+        "retry_strategy": "exponential_backoff_retry",
+    }
+
+    codex_lm._codex_websocket_completion(
+        {
+            "model": "openai/gpt-5.6-luna",
+            "messages": [{"role": "user", "content": "hi"}],
+            "api_key": "secret-token",
+            **client_transport_kwargs,
+        },
+        num_retries=0,
+        connect_timeout=10.0,
+        idle_timeout=300.0,
+    )
+
+    assert client_transport_kwargs.keys().isdisjoint(captured["request"])
+
+
+def test_http_route_keeps_timeout_as_litellm_client_kwarg(monkeypatch):
+    captured = {}
+
+    def fake_responses(**kwargs):
+        captured.update(kwargs)
+        return make_text_response("http")
+
+    monkeypatch.setattr(codex_lm.litellm, "responses", fake_responses)
+
+    response = codex_lm._codex_responses_completion(
+        {
+            "model": "openai/gpt-5.6-terra",
+            "messages": [{"role": "user", "content": "hi"}],
+            "timeout": 600,
+        },
+        num_retries=0,
+    )
+
+    assert response.output[0].content[0].text == "http"
+    assert captured["timeout"] == 600
+
+
+def test_public_http_route_preserves_httpx_timeout(monkeypatch):
+    captured = {}
+    timeout = httpx.Timeout(600)
+
+    def fake_responses(**kwargs):
+        captured.update(kwargs)
+        return make_text_response("http")
+
+    monkeypatch.setattr(codex_lm.litellm, "responses", fake_responses)
+    lm = dspy_codex_auth.LM(
+        "openai/gpt-5.6-terra",
+        auth_provider="codex",
+        api_key="secret-token",
+        chatgpt_account_id="acct_test",
+        codex_transport="http",
+        cache=False,
+    )
+
+    response = lm.forward(prompt="hi", timeout=timeout)
+
+    assert response.output[0].content[0].text == "http"
+    assert captured["timeout"] is timeout
 
 
 @pytest.mark.parametrize("function_call_source", ["terminal", "event"])

@@ -59,9 +59,11 @@ def test_default_auto_transport_routes_only_luna_to_websocket(
             )
             assert lm.codex_transport == "auto"
 
-            outputs = lm(prompt)
+            call_kwargs = {"timeout": 600} if model == "gpt-5.6-luna" else {}
+            outputs = lm(prompt, **call_kwargs)
 
             assert outputs
+
             # The shim returns dict outputs ({'text': ..., 'reasoning_content': ...})
             # for reasoning models on EVERY transport — assert on the text payload.
             def _text(output: object) -> str:

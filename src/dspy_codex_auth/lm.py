@@ -51,6 +51,21 @@ _CODEX_TRANSPORTS = {"auto", "http", "websocket"}
 _CODEX_CACHE_CONTROL_KEY = "_dspy_codex_transport_controls"
 _CODEX_MODEL_NOT_FOUND_PREFIX = "litellm.BadRequestError: OpenAIException - "
 
+_CODEX_WEBSOCKET_CLIENT_ONLY_REQUEST_KEYS = frozenset(
+    {
+        "connect_timeout",
+        "max_retries",
+        "num_retries",
+        "pool_timeout",
+        "read_timeout",
+        "request_timeout",
+        "retry_strategy",
+        "stream_timeout",
+        "timeout",
+        "write_timeout",
+    }
+)
+
 _DSPY_LM = dspy.LM
 _ORIGINAL_DSPY_LM = dspy.LM
 
@@ -78,12 +93,26 @@ def _validate_codex_websocket_timeout(name: str, value: Any) -> float:
     return timeout
 
 
+def _request_timeout_overrides_codex_websocket_idle_timeout(
+    *,
+    per_call_idle_timeout: float | None,
+    constructor_request_timeout: Any,
+    per_call_kwargs: dict[str, Any],
+) -> bool:
+    if per_call_kwargs.get("timeout") is not None:
+        return True
+    if per_call_idle_timeout is not None:
+        return False
+    return "timeout" not in per_call_kwargs and constructor_request_timeout is not None
+
+
 def _codex_cache_request(
     request: dict[str, Any],
     *,
     codex_transport: CodexTransport,
     codex_websocket_connect_timeout: float,
     codex_websocket_idle_timeout: float,
+    request_timeout_overrides_websocket_idle_timeout: bool,
 ) -> dict[str, Any]:
     return {
         **request,
@@ -91,6 +120,9 @@ def _codex_cache_request(
             "transport": codex_transport,
             "connect_timeout": codex_websocket_connect_timeout,
             "idle_timeout": codex_websocket_idle_timeout,
+            "request_timeout_overrides_idle_timeout": (
+                request_timeout_overrides_websocket_idle_timeout
+            ),
         },
     }
 
@@ -99,6 +131,14 @@ def _codex_provider_request(request: dict[str, Any]) -> dict[str, Any]:
     provider_request = dict(request)
     provider_request.pop(_CODEX_CACHE_CONTROL_KEY, None)
     return provider_request
+
+
+def _request_timeout_overrides_idle_timeout(request: dict[str, Any]) -> bool:
+    controls = request.get(_CODEX_CACHE_CONTROL_KEY)
+    return bool(
+        isinstance(controls, dict)
+        and controls.get("request_timeout_overrides_idle_timeout") is True
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -884,6 +924,9 @@ def _prepare_codex_websocket_request(
     request.pop("model_type", None)
     request.pop("use_developer_role", None)
 
+    for key in _CODEX_WEBSOCKET_CLIENT_ONLY_REQUEST_KEYS:
+        request.pop(key, None)
+
     wire_request = {
         key: value
         for key, value in _build_codex_request(request).items()
@@ -989,8 +1032,15 @@ def _codex_completion(
     codex_websocket_idle_timeout: float,
     cache: dict[str, Any] | None = None,
 ) -> Any:
+    request_timeout_overrides_idle_timeout = _request_timeout_overrides_idle_timeout(
+        request
+    )
     request = _codex_provider_request(request)
     if codex_transport == "websocket":
+        if request_timeout_overrides_idle_timeout:
+            codex_websocket_idle_timeout = _validate_codex_websocket_timeout(
+                "timeout", request.get("timeout")
+            )
         return _codex_websocket_completion(
             request,
             num_retries,
@@ -1005,6 +1055,10 @@ def _codex_completion(
     except Exception as exc:
         if not _is_exact_codex_model_not_found(exc, str(request.get("model", ""))):
             raise
+    if request_timeout_overrides_idle_timeout:
+        codex_websocket_idle_timeout = _validate_codex_websocket_timeout(
+            "timeout", request.get("timeout")
+        )
     return _codex_websocket_completion(
         request,
         num_retries,
@@ -1021,8 +1075,15 @@ async def _acodex_completion(
     codex_websocket_idle_timeout: float,
     cache: dict[str, Any] | None = None,
 ) -> Any:
+    request_timeout_overrides_idle_timeout = _request_timeout_overrides_idle_timeout(
+        request
+    )
     request = _codex_provider_request(request)
     if codex_transport == "websocket":
+        if request_timeout_overrides_idle_timeout:
+            codex_websocket_idle_timeout = _validate_codex_websocket_timeout(
+                "timeout", request.get("timeout")
+            )
         return await _acodex_websocket_completion(
             request,
             num_retries,
@@ -1037,6 +1098,10 @@ async def _acodex_completion(
     except Exception as exc:
         if not _is_exact_codex_model_not_found(exc, str(request.get("model", ""))):
             raise
+    if request_timeout_overrides_idle_timeout:
+        codex_websocket_idle_timeout = _validate_codex_websocket_timeout(
+            "timeout", request.get("timeout")
+        )
     return await _acodex_websocket_completion(
         request,
         num_retries,
@@ -1138,6 +1203,13 @@ class LM(_DSPY_LM):
             if codex_websocket_idle_timeout is None
             else codex_websocket_idle_timeout,
         )
+        request_timeout_overrides_idle_timeout = (
+            _request_timeout_overrides_codex_websocket_idle_timeout(
+                per_call_idle_timeout=codex_websocket_idle_timeout,
+                constructor_request_timeout=self.kwargs.get("timeout"),
+                per_call_kwargs=kwargs,
+            )
+        )
         kwargs = dict(kwargs)
         cache = kwargs.pop("cache", self.cache)
 
@@ -1158,6 +1230,9 @@ class LM(_DSPY_LM):
                 codex_transport=selected_transport,
                 codex_websocket_connect_timeout=selected_connect_timeout,
                 codex_websocket_idle_timeout=selected_idle_timeout,
+                request_timeout_overrides_websocket_idle_timeout=(
+                    request_timeout_overrides_idle_timeout
+                ),
             ),
             num_retries=self.num_retries,
             codex_transport=selected_transport,
@@ -1212,6 +1287,13 @@ class LM(_DSPY_LM):
             if codex_websocket_idle_timeout is None
             else codex_websocket_idle_timeout,
         )
+        request_timeout_overrides_idle_timeout = (
+            _request_timeout_overrides_codex_websocket_idle_timeout(
+                per_call_idle_timeout=codex_websocket_idle_timeout,
+                constructor_request_timeout=self.kwargs.get("timeout"),
+                per_call_kwargs=kwargs,
+            )
+        )
         kwargs = dict(kwargs)
         cache = kwargs.pop("cache", self.cache)
 
@@ -1232,6 +1314,9 @@ class LM(_DSPY_LM):
                 codex_transport=selected_transport,
                 codex_websocket_connect_timeout=selected_connect_timeout,
                 codex_websocket_idle_timeout=selected_idle_timeout,
+                request_timeout_overrides_websocket_idle_timeout=(
+                    request_timeout_overrides_idle_timeout
+                ),
             ),
             num_retries=self.num_retries,
             codex_transport=selected_transport,
