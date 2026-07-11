@@ -62,7 +62,14 @@ def test_default_auto_transport_routes_only_luna_to_websocket(
             outputs = lm(prompt)
 
             assert outputs
-            assert all(isinstance(output, str) and output.strip() for output in outputs)
+            # The shim returns dict outputs ({'text': ..., 'reasoning_content': ...})
+            # for reasoning models on EVERY transport — assert on the text payload.
+            def _text(output: object) -> str:
+                if isinstance(output, dict):
+                    return str(output.get("text") or "")
+                return str(output or "")
+
+            assert all(_text(output).strip() for output in outputs)
     finally:
         dspy_codex_auth.uninstall()
 
