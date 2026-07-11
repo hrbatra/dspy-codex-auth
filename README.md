@@ -47,6 +47,50 @@ OpenAI API key route and does not require `OPENAI_API_KEY`.
 `cache=False` is recommended for Codex while iterating because stale DSPy cache
 entries can preserve old empty-output responses across package upgrades.
 
+## Codex Transport Selection
+
+Codex LMs accept `codex_transport` at construction time. Its accepted values
+are exactly `"auto"`, `"http"`, and `"websocket"`:
+
+```python
+lm = dspy.LM(
+    "codex/gpt-5.6-luna",
+    codex_transport="auto",
+    codex_websocket_connect_timeout=10.0,
+    codex_websocket_idle_timeout=300.0,
+    cache=False,
+)
+```
+
+- `"auto"` is the default. It tries HTTP first and falls back to WebSocket only
+  when HTTP returns the exact structured model-not-found error for the requested
+  model. Other HTTP errors remain visible; message heuristics do not trigger a
+  fallback.
+- `"http"` uses HTTP only and never falls back to WebSocket.
+- `"websocket"` uses WebSocket only.
+
+The same three transport values and both timeout options can be overridden for
+one call without changing the LM defaults:
+
+```python
+outputs = lm(
+    "Return exactly the single lowercase token: pink",
+    codex_transport="websocket",
+    codex_websocket_connect_timeout=10.0,
+    codex_websocket_idle_timeout=300.0,
+)
+```
+
+The WebSocket connect timeout defaults to 10 seconds, and its per-event idle
+timeout defaults to 300 seconds. Custom `api_base` values must use HTTP or
+HTTPS; the WebSocket transport converts them to WS or WSS and appends the
+`/responses` path. TLS uses Requests' CA bundle.
+
+Authentication remains in the WebSocket handshake: the bearer credential is
+never placed in the `response.create` data frame. HTTP requests use originator
+`dspy_codex_auth`; WebSocket handshakes use originator `codex_cli_rs`. Both
+preserve the honest `DSPy/<version>` User-Agent supplied by DSPy.
+
 ## Swapping Models
 
 Call `dspy_codex_auth.install()` once near process startup. Codex model strings
@@ -261,6 +305,14 @@ uv sync --dev
 uv run pytest
 uv run ruff check .
 uv build --no-sources
+```
+
+The default test command skips the real-network live transport test. Run it
+explicitly only with valid Codex subscription credentials:
+
+```bash
+DSPY_CODEX_AUTH_RUN_LIVE_TESTS=1 \
+  uv run pytest -m live tests/test_live_websocket.py
 ```
 
 ## Release
