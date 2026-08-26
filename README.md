@@ -3,8 +3,6 @@
 DSPy integration for using ChatGPT/Codex subscription credentials as a DSPy
 language model.
 
-This package is intentionally narrow:
-
 - It includes ChatGPT/Codex OAuth login, token refresh, and Pi-compatible
   credential storage.
 - It installs a DSPy `LM` wrapper for `codex/...` model strings.
@@ -19,12 +17,6 @@ uv add dspy-codex-auth
 
 ## Login
 
-If you already have Codex credentials in `~/.pi/agent/auth.json`, no extra
-login is needed. The package reads and refreshes that Pi-compatible credential
-file directly.
-
-Otherwise:
-
 ```bash
 uv run python -c "import dspy_codex_auth; dspy_codex_auth.login()"
 ```
@@ -37,7 +29,7 @@ import dspy_codex_auth
 
 dspy_codex_auth.install()
 
-lm = dspy.LM("codex/gpt-5.5", cache=False)
+lm = dspy.LM("codex/gpt-5.6-luna", cache=False)
 dspy.configure(lm=lm, adapter=dspy.JSONAdapter())
 ```
 
