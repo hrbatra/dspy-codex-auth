@@ -19,16 +19,17 @@ from typing import Any, Literal, cast
 import dspy
 import litellm
 from litellm.types.responses.main import OutputFunctionToolCall
-
-from dspy_codex_auth.auth import (
+from openai_codex_auth import (
+    DEFAULT_CODEX_API_BASE,
     OPENAI_CODEX_PROVIDER,
     AuthStorage,
-    extract_chatgpt_account_id,
+    codex_headers,
     get_default_auth_storage,
     getauthtoken,
     normalize_provider_id,
     set_default_auth_storage,
 )
+
 from dspy_codex_auth.responses_websocket import (
     DEFAULT_CODEX_WEBSOCKET_CONNECT_TIMEOUT,
     DEFAULT_CODEX_WEBSOCKET_IDLE_TIMEOUT,
@@ -41,7 +42,6 @@ from dspy_codex_auth.responses_websocket import (
 )
 
 DEFAULT_CODEX_MODEL = "gpt-5.4"
-DEFAULT_CODEX_API_BASE = "https://chatgpt.com/backend-api/codex"
 DEFAULT_CODEX_ORIGINATOR = "dspy_codex_auth"
 DEFAULT_CODEX_INSTRUCTIONS = "You are a helpful assistant."
 
@@ -169,24 +169,6 @@ def register_model_alias(
 
 def unregister_model_alias(alias: str) -> None:
     _ROUTE_RESOLVERS.pop(alias, None)
-
-
-def codex_headers(
-    token: str,
-    *,
-    account_id: str | None = None,
-    originator: str = DEFAULT_CODEX_ORIGINATOR,
-    extra_headers: dict[str, Any] | None = None,
-) -> dict[str, str]:
-    resolved_account_id = account_id or extract_chatgpt_account_id(token)
-    headers = {
-        "chatgpt-account-id": resolved_account_id,
-        "OpenAI-Beta": "responses=experimental",
-        "originator": originator,
-    }
-    if extra_headers:
-        headers.update({str(key): str(value) for key, value in extra_headers.items()})
-    return headers
 
 
 def _resolve_codex_route(
@@ -1373,7 +1355,6 @@ __all__ = [
     "DEFAULT_CODEX_WEBSOCKET_IDLE_TIMEOUT",
     "LM",
     "RouteRegistration",
-    "codex_headers",
     "install",
     "register_model_alias",
     "resolve_lm_route",

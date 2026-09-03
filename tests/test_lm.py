@@ -13,7 +13,7 @@ import pytest
 import dspy_codex_auth
 import dspy_codex_auth.lm as codex_lm
 import dspy_codex_auth.responses_websocket as websocket_module
-from dspy_codex_auth.auth import AuthStorage
+from openai_codex_auth import AuthStorage
 
 
 def _b64url(data: dict) -> str:

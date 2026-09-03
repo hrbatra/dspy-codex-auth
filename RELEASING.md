@@ -11,6 +11,28 @@ https://github.com/hrbatra/dspy-codex-auth
 PyPI releases are immutable. Every package update needs a new version number,
 even if the change is only README/docs.
 
+## Dependency on openai-codex-auth
+
+This package depends on `openai-codex-auth`
+(https://github.com/hrbatra/openai-codex-auth). While that package is
+unpublished, `pyproject.toml` carries a temporary `[tool.uv.sources]` entry
+pointing at the sibling checkout so local development resolves. Before merging
+or releasing:
+
+1. Publish `openai-codex-auth` (see its `RELEASING.md`).
+2. Replace the path source with the PyPI dependency:
+
+```bash
+uv remove openai-codex-auth
+uv add "openai-codex-auth>=0.1.0"
+```
+
+3. Confirm `[tool.uv.sources]` no longer mentions `openai-codex-auth`, run the
+   usual checks, and commit `pyproject.toml` and `uv.lock`.
+
+When a later change here needs a newer `openai-codex-auth`, release that
+package first and raise the minimum version here.
+
 ## Local Release
 
 Use this path when publishing from your machine with a PyPI token in

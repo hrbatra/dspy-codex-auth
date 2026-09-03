@@ -336,6 +336,7 @@ source = { editable = "." }
 dependencies = [
     { name = "dspy" },
     { name = "litellm" },
+    { name = "openai-codex-auth" },
     { name = "requests" },
     { name = "websockets" },
 ]
@@ -350,6 +351,7 @@ dev = [
 requires-dist = [
     { name = "dspy", specifier = ">=3.2.0" },
     { name = "litellm", specifier = ">=1.82.6" },
+    { name = "openai-codex-auth", editable = "../openai-codex-auth" },
     { name = "requests", specifier = ">=2.33.1" },
     { name = "websockets", specifier = ">=16.1" },
 ]
@@ -1040,6 +1042,23 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/f0/ee/d056c82f63c05f06baac0cffb4a90952d8274f90c49dfe244f20497b9bbd/openai-2.33.0.tar.gz", hash = "sha256:f850c435e2a4685bba3295bd54912dd26315d9c1b7733068186134d6e0599f9a", size = 693254, upload-time = "2026-04-28T14:04:42.428Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/7d/32/37734d769bc8b42e4938785313cc05aade6cb0fa72479d3220a0d61a4e78/openai-2.33.0-py3-none-any.whl", hash = "sha256:03ac37d70e8c9e3a8124214e3afa785e2cbc12e627fbd98177a086ef2fd87ad5", size = 1162695, upload-time = "2026-04-28T14:04:40.482Z" },
+]
+
+[[package]]
+name = "openai-codex-auth"
+version = "0.1.0"
+source = { editable = "../openai-codex-auth" }
+dependencies = [
+    { name = "requests" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "requests", specifier = ">=2.32.0" }]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=8.0" },
+    { name = "ruff", specifier = ">=0.15" },
 ]
 
 [[package]]

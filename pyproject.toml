@@ -21,6 +21,7 @@ classifiers = [
 dependencies = [
     "dspy>=3.2.0",
     "litellm>=1.82.6",
+    "openai-codex-auth",
     "requests>=2.33.1",
     "websockets>=16.1",
 ]
@@ -39,3 +40,6 @@ dev = [
     "pytest>=9.0.3",
     "ruff>=0.15.12",
 ]
+
+[tool.uv.sources]
+openai-codex-auth = { path = "../openai-codex-auth", editable = true }
