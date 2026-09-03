@@ -10,7 +10,7 @@ import dspy_codex_auth
 
 
 def test_user_facing_auth_helpers_are_re_exported():
-    for name in ("AuthStorage", "getauthtoken", "login", "logout"):
+    for name in ("CodexAuth", "getauthtoken"):
         assert getattr(dspy_codex_auth, name) is getattr(openai_codex_auth, name)
 
 

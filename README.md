@@ -5,9 +5,9 @@ language model.
 
 This package is intentionally narrow:
 
-- It uses [`openai-codex-auth`](https://github.com/hrbatra/openai-codex-auth)
-  for ChatGPT/Codex OAuth login, token refresh, and Pi-compatible credential
-  storage, so the credential file is shared with other clients.
+- It authenticates through [`openai-codex-auth`](https://github.com/hrbatra/openai-codex-auth),
+  which reads the Codex CLI's `codex login` credential, so there is no
+  separate login flow and no API key.
 - It installs a DSPy `LM` wrapper for `codex/...` model strings.
 - It fixes Codex Responses streaming shapes that DSPy 3.2 cannot parse from
   the current Codex backend response stream.
@@ -20,19 +20,16 @@ uv add dspy-codex-auth
 
 ## Login
 
-If you already have Codex credentials in `~/.pi/agent/auth.json`, no extra
-login is needed. The package reads and refreshes that Pi-compatible credential
-file directly.
-
-Otherwise:
+Sign in once with the Codex CLI and choose "Sign in with ChatGPT":
 
 ```bash
-uv run python -c "import dspy_codex_auth; dspy_codex_auth.login()"
+codex login
 ```
 
-`login`, `logout`, `getauthtoken`, and `AuthStorage` are re-exports from
-`openai-codex-auth`; anything else auth-related is imported from
-`openai_codex_auth` directly.
+The package reads `~/.codex/auth.json` and refreshes the token when needed.
+`CodexAuth` and `getauthtoken` are re-exports from `openai-codex-auth`; pass
+`auth_storage=` (a `CodexAuth` or a path) to `install()` or `LM(...)` to use a
+different auth file.
 
 ## Basic Usage
 
@@ -291,7 +288,7 @@ print(lm.history[-1]["outputs"][0].get("reasoning_content"))
 ## Attribution
 
 `dspy-codex-auth` includes and adapts MIT-licensed DSPy integration code from
-`dspy-lm-auth`; the adapted auth code now lives in `openai-codex-auth`:
+`dspy-lm-auth`:
 
 https://github.com/MaximeRivest/dspy-lm-auth
 

@@ -1,9 +1,8 @@
 # Third-Party Notices
 
 `dspy-codex-auth` includes and adapts MIT-licensed DSPy integration code from
-`dspy-lm-auth`. The adapted auth code was split out into `openai-codex-auth`
-(https://github.com/hrbatra/openai-codex-auth), which carries its own copy of
-this notice:
+`dspy-lm-auth`. The adapted auth code was removed in favour of
+`openai-codex-auth`, which reads the Codex CLI's login:
 
 https://github.com/MaximeRivest/dspy-lm-auth
 

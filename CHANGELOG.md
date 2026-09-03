@@ -4,13 +4,13 @@
 
 ### Changed
 
-- The auth layer (OAuth login, token refresh, Pi-compatible credential
-  storage) moved to the new `openai-codex-auth` package, now a runtime
-  dependency. `dspy_codex_auth.auth` is gone. `login`, `logout`,
-  `getauthtoken`, and `AuthStorage` stay re-exported here; everything else
-  is imported from `openai_codex_auth`.
-- The login flow now identifies itself as `openai_codex_auth`; request headers
-  still carry the `dspy_codex_auth` originator.
+- Authentication now comes from the new `openai-codex-auth` dependency, which
+  reads the Codex CLI's `codex login` credential (`~/.codex/auth.json`) and
+  refreshes it when needed. The package's own OAuth login flow, the Pi-format
+  `~/.pi/agent/auth.json` store, `login()`, `logout()`, and `AuthStorage` are
+  gone; `CodexAuth` and `getauthtoken` are re-exported.
+- `install(auth_storage=...)` and `LM(auth_storage=...)` take a `CodexAuth` or
+  a path to a Codex CLI auth file.
 
 ## 0.1.7 - 2026-07-11
 
