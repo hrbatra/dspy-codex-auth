@@ -351,7 +351,7 @@ dev = [
 requires-dist = [
     { name = "dspy", specifier = ">=3.2.0" },
     { name = "litellm", specifier = ">=1.82.6" },
-    { name = "openai-codex-auth", editable = "../openai-codex-auth" },
+    { name = "openai-codex-auth", specifier = ">=0.1.0" },
     { name = "requests", specifier = ">=2.33.1" },
     { name = "websockets", specifier = ">=16.1" },
 ]
@@ -1047,18 +1047,13 @@ wheels = [
 [[package]]
 name = "openai-codex-auth"
 version = "0.1.0"
-source = { editable = "../openai-codex-auth" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "requests" },
 ]
-
-[package.metadata]
-requires-dist = [{ name = "requests", specifier = ">=2.32.0" }]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest", specifier = ">=8.0" },
-    { name = "ruff", specifier = ">=0.15" },
+sdist = { url = "https://files.pythonhosted.org/packages/1f/08/98ce522dd7156b5a15b3b63657cba8b24d5f6e1ff16b09f438b49c4aa3cf/openai_codex_auth-0.1.0.tar.gz", hash = "sha256:8ac25a2203fe9d5f0baccb29170da4b4008b756f9c8b858cbb5c610f6edb2abb", size = 4091, upload-time = "2026-09-04T04:03:06.749Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/94/59/def548432867da955bf53fe93f681dc664c463ab69a8c4078e28d2f20995/openai_codex_auth-0.1.0-py3-none-any.whl", hash = "sha256:b344b0557d7b6b1dc57f47edc2d622611e7bee696c39f095a96b8289a66d1d86", size = 5081, upload-time = "2026-09-04T04:03:05.776Z" },
 ]
 
 [[package]]
