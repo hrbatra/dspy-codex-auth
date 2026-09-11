@@ -13,7 +13,7 @@ import pytest
 import dspy_codex_auth
 import dspy_codex_auth.lm as codex_lm
 import dspy_codex_auth.responses_websocket as websocket_module
-from dspy_codex_auth.auth import AuthStorage
+from openai_codex_auth import CodexAuth
 
 
 def _b64url(data: dict) -> str:
@@ -24,24 +24,29 @@ def _b64url(data: dict) -> str:
 def make_fake_jwt(account_id: str = "acct_test") -> str:
     header = _b64url({"alg": "none", "typ": "JWT"})
     payload = _b64url(
-        {"https://api.openai.com/auth": {"chatgpt_account_id": account_id}}
+        {
+            "exp": int(time.time()) + 3600,
+            "https://api.openai.com/auth": {"chatgpt_account_id": account_id},
+        }
     )
     return f"{header}.{payload}.signature"
 
 
-def make_auth_storage(tmp_path, account_id: str = "acct_test") -> AuthStorage:
-    storage = AuthStorage(tmp_path / "auth.json")
-    storage.set(
-        "openai-codex",
-        {
-            "type": "oauth",
-            "access": make_fake_jwt(account_id),
-            "refresh": "refresh-token",
-            "expires": int(time.time() * 1000) + 60_000,
-            "accountId": account_id,
-        },
+def make_auth_storage(tmp_path, account_id: str = "acct_test") -> CodexAuth:
+    path = tmp_path / "auth.json"
+    path.write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": make_fake_jwt(account_id),
+                    "refresh_token": "refresh-token",
+                    "account_id": account_id,
+                },
+            }
+        )
     )
-    return storage
+    return CodexAuth(path)
 
 
 class FakeResponsesStream:

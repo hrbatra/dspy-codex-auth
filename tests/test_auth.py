@@ -1,69 +1,115 @@
-from __future__ import annotations
+"""The auth layer lives in openai-codex-auth; this package only re-exports the
+user-facing helpers."""
 
 import base64
+import importlib
 import json
-from pathlib import Path
+import time
 import tomllib
+from pathlib import Path
 
-from dspy_codex_auth.auth import (
-    AuthStorage,
-    build_openai_codex_authorization_url,
-    extract_chatgpt_account_id,
-    normalize_provider_id,
-    parse_authorization_input,
-)
+import openai_codex_auth
+import pytest
+from packaging.requirements import Requirement
 
-
-def _b64url(data: dict) -> str:
-    raw = json.dumps(data, separators=(",", ":")).encode("utf-8")
-    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+import dspy_codex_auth
 
 
-def _fake_jwt(account_id: str = "acct_test") -> str:
-    return ".".join(
-        [
-            _b64url({"alg": "none", "typ": "JWT"}),
-            _b64url(
-                {"https://api.openai.com/auth": {"chatgpt_account_id": account_id}}
-            ),
-            "signature",
-        ]
-    )
+def test_user_facing_auth_helpers_are_re_exported():
+    for name in ("CodexAuth", "getauthtoken"):
+        assert getattr(dspy_codex_auth, name) is getattr(openai_codex_auth, name)
 
 
-def test_auth_storage_uses_codex_aliases(tmp_path):
-    storage = AuthStorage(tmp_path / "auth.json")
-    storage.set("codex", {"type": "api_key", "key": "token"})
-
-    assert normalize_provider_id("chatgpt") == "openai-codex"
-    assert storage.get_api_key("openai-codex") == "token"
-    assert storage.get_api_key("chatgpt") == "token"
-
-
-def test_extract_chatgpt_account_id_from_jwt():
-    assert extract_chatgpt_account_id(_fake_jwt("acct_live")) == "acct_live"
-
-
-def test_parse_authorization_input_accepts_url_query_and_hash_pair():
-    url_code, url_state = parse_authorization_input(
-        "http://localhost:1455/auth/callback?code=abc&state=xyz"
-    )
-    hash_code, hash_state = parse_authorization_input("abc#xyz")
-
-    assert (url_code, url_state) == ("abc", "xyz")
-    assert (hash_code, hash_state) == ("abc", "xyz")
-
-
-def test_authorization_url_uses_package_originator():
-    url = build_openai_codex_authorization_url(state="state", challenge="challenge")
-
-    assert "originator=dspy_codex_auth" in url
-    assert "client_id=app_EMoamEEZ73f0CkXaXp7hrann" in url
-
-
-def test_project_has_no_dspy_lm_auth_runtime_dependency():
+def test_project_depends_on_dspy_and_published_openai_codex_auth():
     pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
-    pyproject = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
-    dependencies = pyproject["project"]["dependencies"]
+    project = tomllib.loads(pyproject_path.read_text())["project"]
+    requirements = [Requirement(value) for value in project["dependencies"]]
+    dependencies = {requirement.name: requirement for requirement in requirements}
 
-    assert all("dspy-lm-auth" not in dependency for dependency in dependencies)
+    assert {"dspy", "openai-codex-auth"} <= dependencies.keys()
+    assert dependencies["openai-codex-auth"].url is None
+    assert "dspy-lm-auth" not in dependencies
+
+
+def test_auth_dependency_is_locked_to_published_registry_package():
+    lock_path = Path(__file__).resolve().parents[1] / "uv.lock"
+    packages = tomllib.loads(lock_path.read_text())["package"]
+    auth_package = next(
+        package for package in packages if package["name"] == "openai-codex-auth"
+    )
+
+    assert auth_package["source"] == {"registry": "https://pypi.org/simple"}
+
+
+def test_legacy_auth_module_is_removed():
+    with pytest.raises(ModuleNotFoundError) as exc_info:
+        importlib.import_module("dspy_codex_auth.auth")
+
+    assert exc_info.value.name == "dspy_codex_auth.auth"
+
+
+def test_legacy_auth_apis_are_removed():
+    for name in (
+        "AuthStorage",
+        "ApiKeyCredential",
+        "OAuthCredential",
+        "OpenAICodexOAuthProvider",
+        "login",
+        "logout",
+        "login_openai_codex",
+        "register_oauth_provider",
+        "get_default_auth_storage",
+        "set_default_auth_storage",
+    ):
+        assert not hasattr(dspy_codex_auth, name), name
+
+
+def test_lm_rejects_pi_credentials_without_modifying_the_file(tmp_path):
+    auth_path = tmp_path / "auth.json"
+    original = json.dumps(
+        {
+            "openai-codex": {
+                "type": "oauth",
+                "access": "synthetic-pi-access-token",
+                "refresh": "synthetic-pi-refresh-token",
+                "expires": int(time.time() * 1000) + 3_600_000,
+                "accountId": "acct_pi",
+            }
+        }
+    )
+    auth_path.write_text(original)
+
+    with pytest.raises(openai_codex_auth.CodexAuthError, match="codex login"):
+        dspy_codex_auth.LM("codex/gpt-5.5", auth_storage=auth_path, cache=False)
+
+    assert auth_path.read_text() == original
+
+
+@pytest.mark.parametrize("path_type", (str, Path))
+def test_lm_reads_codex_cli_credentials_from_explicit_path(tmp_path, path_type):
+    claims = {
+        "exp": int(time.time()) + 3600,
+        "https://api.openai.com/auth": {"chatgpt_account_id": "acct_codex"},
+    }
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=")
+    token = f"e30.{payload.decode()}.synthetic-signature"
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": token,
+                    "refresh_token": "synthetic-refresh-token",
+                    "account_id": "acct_codex",
+                },
+            }
+        )
+    )
+
+    lm = dspy_codex_auth.LM(
+        "codex/gpt-5.5", auth_storage=path_type(auth_path), cache=False
+    )
+
+    assert lm.kwargs["api_key"] == token
+    assert lm.kwargs["headers"]["chatgpt-account-id"] == "acct_codex"

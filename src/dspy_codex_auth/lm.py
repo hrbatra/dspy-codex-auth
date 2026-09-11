@@ -19,16 +19,8 @@ from typing import Any, Literal, cast
 import dspy
 import litellm
 from litellm.types.responses.main import OutputFunctionToolCall
+from openai_codex_auth import DEFAULT_CODEX_API_BASE, CodexAuth, codex_headers, getauthtoken
 
-from dspy_codex_auth.auth import (
-    OPENAI_CODEX_PROVIDER,
-    AuthStorage,
-    extract_chatgpt_account_id,
-    get_default_auth_storage,
-    getauthtoken,
-    normalize_provider_id,
-    set_default_auth_storage,
-)
 from dspy_codex_auth.responses_websocket import (
     DEFAULT_CODEX_WEBSOCKET_CONNECT_TIMEOUT,
     DEFAULT_CODEX_WEBSOCKET_IDLE_TIMEOUT,
@@ -41,9 +33,12 @@ from dspy_codex_auth.responses_websocket import (
 )
 
 DEFAULT_CODEX_MODEL = "gpt-5.4"
-DEFAULT_CODEX_API_BASE = "https://chatgpt.com/backend-api/codex"
 DEFAULT_CODEX_ORIGINATOR = "dspy_codex_auth"
 DEFAULT_CODEX_INSTRUCTIONS = "You are a helpful assistant."
+
+OPENAI_CODEX_PROVIDER = "openai-codex"
+_CODEX_ROUTE_ALIASES = ("codex", "chatgpt", OPENAI_CODEX_PROVIDER)
+_DEFAULT_AUTH: CodexAuth | None = None
 
 type CodexTransport = Literal["auto", "http", "websocket"]
 
@@ -69,7 +64,7 @@ _CODEX_WEBSOCKET_CLIENT_ONLY_REQUEST_KEYS = frozenset(
 _DSPY_LM = dspy.LM
 _ORIGINAL_DSPY_LM = dspy.LM
 
-RouteResolver = Callable[[str, dict[str, Any], AuthStorage], tuple[str, dict[str, Any]]]
+RouteResolver = Callable[[str, dict[str, Any], CodexAuth], tuple[str, dict[str, Any]]]
 _ROUTE_RESOLVERS: dict[str, RouteResolver] = {}
 
 
@@ -148,13 +143,17 @@ class RouteRegistration:
 
 
 def _coerce_auth_storage(
-    auth_storage: AuthStorage | str | os.PathLike[str] | None,
-) -> AuthStorage:
+    auth_storage: CodexAuth | str | os.PathLike[str] | None,
+) -> CodexAuth:
     if auth_storage is None:
-        return get_default_auth_storage()
-    if isinstance(auth_storage, AuthStorage):
+        return _DEFAULT_AUTH or CodexAuth()
+    if isinstance(auth_storage, CodexAuth):
         return auth_storage
-    return AuthStorage(auth_storage)
+    return CodexAuth(auth_storage)
+
+
+def _normalize_route(name: str) -> str:
+    return OPENAI_CODEX_PROVIDER if name in _CODEX_ROUTE_ALIASES else name
 
 
 def register_model_alias(
@@ -171,28 +170,10 @@ def unregister_model_alias(alias: str) -> None:
     _ROUTE_RESOLVERS.pop(alias, None)
 
 
-def codex_headers(
-    token: str,
-    *,
-    account_id: str | None = None,
-    originator: str = DEFAULT_CODEX_ORIGINATOR,
-    extra_headers: dict[str, Any] | None = None,
-) -> dict[str, str]:
-    resolved_account_id = account_id or extract_chatgpt_account_id(token)
-    headers = {
-        "chatgpt-account-id": resolved_account_id,
-        "OpenAI-Beta": "responses=experimental",
-        "originator": originator,
-    }
-    if extra_headers:
-        headers.update({str(key): str(value) for key, value in extra_headers.items()})
-    return headers
-
-
 def _resolve_codex_route(
     model: str,
     kwargs: dict[str, Any],
-    auth_storage: AuthStorage,
+    auth_storage: CodexAuth,
 ) -> tuple[str, dict[str, Any]]:
     if "/" in model:
         _, model_id = model.split("/", 1)
@@ -200,21 +181,10 @@ def _resolve_codex_route(
         model_id = DEFAULT_CODEX_MODEL
 
     resolved_kwargs = dict(kwargs)
-    token = resolved_kwargs.get("api_key") or auth_storage.get_api_key(
-        OPENAI_CODEX_PROVIDER
-    )
-    if not token:
-        raise ValueError(
-            "No OpenAI Codex credential found. Run `dspy_codex_auth.login()`, "
-            "reuse Pi's auth.json, or pass `api_key=` explicitly."
-        )
-
-    credential = auth_storage.get(OPENAI_CODEX_PROVIDER)
+    token = resolved_kwargs.get("api_key") or auth_storage.token()
     account_id = resolved_kwargs.pop("chatgpt_account_id", None)
-    if account_id is None and isinstance(credential, dict):
-        raw_account_id = credential.get("accountId")
-        if isinstance(raw_account_id, str) and raw_account_id:
-            account_id = raw_account_id
+    if account_id is None and "api_key" not in resolved_kwargs:
+        account_id = auth_storage.account_id()
 
     originator = str(resolved_kwargs.pop("originator", DEFAULT_CODEX_ORIGINATOR))
     headers = codex_headers(
@@ -235,14 +205,14 @@ def _resolve_codex_route(
 def resolve_lm_route(
     model: str,
     *,
-    auth_storage: AuthStorage,
+    auth_storage: CodexAuth,
     auth_provider: str | None = None,
     kwargs: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     resolved_kwargs = dict(kwargs or {})
 
     if auth_provider:
-        provider = normalize_provider_id(auth_provider)
+        provider = _normalize_route(auth_provider)
         resolver = _ROUTE_RESOLVERS.get(provider)
         if resolver is None:
             raise ValueError(
@@ -1117,7 +1087,7 @@ class LM(_DSPY_LM):
         self,
         model: str,
         *args: Any,
-        auth_storage: AuthStorage | str | os.PathLike[str] | None = None,
+        auth_storage: CodexAuth | str | os.PathLike[str] | None = None,
         auth_provider: str | None = None,
         codex_transport: Literal["auto", "http", "websocket"] = "auto",
         codex_websocket_connect_timeout: float = (
@@ -1135,7 +1105,7 @@ class LM(_DSPY_LM):
             "codex_websocket_idle_timeout",
             codex_websocket_idle_timeout,
         )
-        requested_route = normalize_provider_id(
+        requested_route = _normalize_route(
             auth_provider if auth_provider else model.split("/", 1)[0]
         )
         if requested_route == OPENAI_CODEX_PROVIDER:
@@ -1340,11 +1310,11 @@ class LM(_DSPY_LM):
 
 def install(
     *,
-    auth_storage: AuthStorage | str | os.PathLike[str] | None = None,
+    auth_storage: CodexAuth | str | os.PathLike[str] | None = None,
     attach_helpers: bool = True,
 ) -> type[LM]:
-    storage = _coerce_auth_storage(auth_storage)
-    set_default_auth_storage(storage)
+    global _DEFAULT_AUTH
+    _DEFAULT_AUTH = _coerce_auth_storage(auth_storage)
 
     dspy.LM = LM
     dspy.clients.LM = LM
@@ -1373,7 +1343,6 @@ __all__ = [
     "DEFAULT_CODEX_WEBSOCKET_IDLE_TIMEOUT",
     "LM",
     "RouteRegistration",
-    "codex_headers",
     "install",
     "register_model_alias",
     "resolve_lm_route",

@@ -11,6 +11,20 @@ https://github.com/hrbatra/dspy-codex-auth
 PyPI releases are immutable. Every package update needs a new version number,
 even if the change is only README/docs.
 
+## Dependency on openai-codex-auth
+
+This package depends on the published
+[`openai-codex-auth`](https://pypi.org/project/openai-codex-auth/) package for
+Codex CLI credentials and token refresh. Keep both packages: this repository
+owns DSPy integration and model transports, while the auth package can also
+be used independently. No Pi plugin or credential store is required.
+
+`pyproject.toml` and `uv.lock` resolve the auth package from PyPI, with no local
+path source. When a change here needs a newer auth API, release
+`openai-codex-auth` first, update the dependency with `uv add`, and commit
+`pyproject.toml` and `uv.lock`. Verify with `uv sync --locked --dev` and
+`uv build --no-sources` before releasing.
+
 ## Local Release
 
 Use this path when publishing from your machine with a PyPI token in

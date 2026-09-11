@@ -3,8 +3,9 @@
 DSPy integration for using ChatGPT/Codex subscription credentials as a DSPy
 language model.
 
-- It includes ChatGPT/Codex OAuth login, token refresh, and Pi-compatible
-  credential storage.
+- It authenticates through [`openai-codex-auth`](https://github.com/hrbatra/openai-codex-auth),
+  which reads the Codex CLI's `codex login` credential, so there is no
+  separate login flow and no API key.
 - It installs a DSPy `LM` wrapper for `codex/...` model strings.
 - It fixes Codex Responses streaming shapes that DSPy 3.2 cannot parse from
   the current Codex backend response stream.
@@ -12,14 +13,30 @@ language model.
 ## Install
 
 ```bash
-uv add dspy-codex-auth
+uv add dspy-codex-auth openai-codex-auth
 ```
+
+The two packages have separate roles: `openai-codex-auth` handles Codex CLI
+credentials and token refresh; `dspy-codex-auth` provides the DSPy LM and model
+transports. The DSPy package also declares the auth package as a dependency,
+so installing it alone brings in both. No Pi installation or plugin is needed.
 
 ## Login
 
+Sign in once with the Codex CLI and choose "Sign in with ChatGPT":
+
 ```bash
-uv run python -c "import dspy_codex_auth; dspy_codex_auth.login()"
+codex login
 ```
+
+The package reads `~/.codex/auth.json` and refreshes the token when needed.
+`CodexAuth` and `getauthtoken` are re-exports from `openai-codex-auth`; pass
+`auth_storage=` (a `CodexAuth` or a path) to `install()` or `LM(...)` to use a
+different auth file.
+
+This integration requires a file-backed ChatGPT login. Codex can also store
+credentials in the OS credential store, which this package does not read; see
+the [Codex authentication documentation](https://learn.chatgpt.com/docs/auth#login-caching).
 
 ## Basic Usage
 
@@ -277,8 +294,8 @@ print(lm.history[-1]["outputs"][0].get("reasoning_content"))
 
 ## Attribution
 
-`dspy-codex-auth` includes and adapts MIT-licensed auth and DSPy integration
-code from `dspy-lm-auth`:
+`dspy-codex-auth` includes and adapts MIT-licensed DSPy integration code from
+`dspy-lm-auth`:
 
 https://github.com/MaximeRivest/dspy-lm-auth
 
