@@ -15,9 +15,9 @@ even if the change is only README/docs.
 
 This package depends on the published
 [`openai-codex-auth`](https://pypi.org/project/openai-codex-auth/) package for
-Codex CLI credentials and token refresh. Keep both packages: this repository
-owns DSPy integration and model transports, while the auth package can also
-be used independently. No Pi plugin or credential store is required.
+Codex CLI credentials, HTTP/WebSocket transports, and streaming reconstruction.
+This repository owns DSPy integration; the core client also works independently
+of DSPy. No Pi plugin or credential store is required.
 
 `pyproject.toml` and `uv.lock` resolve the auth package from PyPI, with no local
 path source. When a change here needs a newer auth API, release

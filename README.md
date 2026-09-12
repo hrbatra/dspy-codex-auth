@@ -3,23 +3,22 @@
 DSPy integration for using ChatGPT/Codex subscription credentials as a DSPy
 language model.
 
-- It authenticates through [`openai-codex-auth`](https://github.com/hrbatra/openai-codex-auth),
-  which reads the Codex CLI's `codex login` credential, so there is no
-  separate login flow and no API key.
+- It uses [`openai-codex-auth`](https://github.com/hrbatra/openai-codex-auth)
+  for authentication, HTTP/WebSocket requests, and streamed-response handling.
 - It installs a DSPy `LM` wrapper for `codex/...` model strings.
-- It fixes Codex Responses streaming shapes that DSPy 3.2 cannot parse from
-  the current Codex backend response stream.
+- It converts DSPy messages and options into native Codex requests, and converts
+  shared client responses into DSPy's output, history, and usage formats.
 
 ## Install
 
 ```bash
-uv add dspy-codex-auth openai-codex-auth
+uv add dspy-codex-auth
 ```
 
-The two packages have separate roles: `openai-codex-auth` handles Codex CLI
-credentials and token refresh; `dspy-codex-auth` provides the DSPy LM and model
-transports. The DSPy package also declares the auth package as a dependency,
-so installing it alone brings in both. No Pi installation or plugin is needed.
+The two packages have separate roles: `openai-codex-auth` provides the reusable
+Codex client; `dspy-codex-auth` provides its DSPy adapter. Installing the adapter
+brings in both packages. For ordinary Python without DSPy, install
+`openai-codex-auth` and use `CodexClient` directly. No Pi plugin is needed.
 
 ## Login
 
@@ -29,7 +28,11 @@ Sign in once with the Codex CLI and choose "Sign in with ChatGPT":
 codex login
 ```
 
-The package reads `~/.codex/auth.json` and refreshes the token when needed.
+The adapter reads the account identity from `~/.codex/auth.json` on each call,
+including cache lookup, to keep cached results separate across accounts. The
+shared client refreshes the token when an uncached request is sent. Constructing
+an LM does not read credentials; credential errors surface on its first call.
+Cached calls using file-backed auth still require a readable credential file.
 `CodexAuth` and `getauthtoken` are re-exports from `openai-codex-auth`; pass
 `auth_storage=` (a `CodexAuth` or a path) to `install()` or `LM(...)` to use a
 different auth file.
@@ -94,6 +97,12 @@ The WebSocket connect timeout defaults to 10 seconds, and its per-event idle
 timeout defaults to 300 seconds. Custom `api_base` values must use HTTP or
 HTTPS; the WebSocket transport converts them to WS or WSS and appends the
 `/responses` path. TLS uses Requests' CA bundle.
+
+The shared client owns retries. `num_retries` counts additional attempts across
+transports; retry delays begin at 0.5 seconds and double up to 8 seconds.
+Auto selection may additionally make an HTTP routing probe. An explicit numeric
+`timeout` also controls WebSocket idle time under the existing call/constructor
+precedence; HTTP supports phase-specific `httpx.Timeout` values.
 
 Authentication remains in the WebSocket handshake: the bearer credential is
 never placed in the `response.create` data frame. HTTP requests use originator
@@ -203,13 +212,16 @@ strings and you want auth selection to be a separate setting.
 
 ## What It Fixes
 
-The ChatGPT Codex backend streams useful output events, but the completed
-LiteLLM Responses object can arrive with `response.output == []`. DSPy expects
-Responses output items to contain final message text, function calls, and
-reasoning summaries. This package reconstructs those output items from stream
-events before DSPy parses the response.
+The shared Codex client reconstructs missing output from streamed events,
+preserving provider metadata, message text, function calls, and reasoning
+summaries. This adapter converts that response into the objects DSPy expects.
+Codex requests no longer pass through LiteLLM's Responses transport.
 
-It currently handles:
+A provider refusal raises `openai_codex_auth.CodexError` in this adapter so it
+cannot become an empty DSPy prediction. Direct `CodexClient` callers receive
+the native refusal item in `CodexResponse.output`.
+
+The adapter and shared core together handle:
 
 - DSPy few-shot and conversation-history assistant messages by encoding them as
   Responses `output_text` blocks, which supports optimizers such as

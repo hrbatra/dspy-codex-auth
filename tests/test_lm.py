@@ -9,39 +9,28 @@ from types import SimpleNamespace
 import dspy
 import httpx
 import pytest
+from openai_codex_auth import CodexAuth, CodexResponse
+from pydantic import BaseModel
 
 import dspy_codex_auth
 import dspy_codex_auth.lm as codex_lm
-import dspy_codex_auth.responses_websocket as websocket_module
-from openai_codex_auth import CodexAuth
 
 
-def _b64url(data: dict) -> str:
-    raw = json.dumps(data, separators=(",", ":")).encode("utf-8")
-    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
-
-
-def make_fake_jwt(account_id: str = "acct_test") -> str:
-    header = _b64url({"alg": "none", "typ": "JWT"})
-    payload = _b64url(
-        {
-            "exp": int(time.time()) + 3600,
-            "https://api.openai.com/auth": {"chatgpt_account_id": account_id},
-        }
-    )
-    return f"{header}.{payload}.signature"
-
-
-def make_auth_storage(tmp_path, account_id: str = "acct_test") -> CodexAuth:
+def make_auth_storage(tmp_path) -> CodexAuth:
+    claims = {
+        "exp": int(time.time()) + 3600,
+        "https://api.openai.com/auth": {"chatgpt_account_id": "acct_test"},
+    }
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=")
     path = tmp_path / "auth.json"
     path.write_text(
         json.dumps(
             {
                 "auth_mode": "chatgpt",
                 "tokens": {
-                    "access_token": make_fake_jwt(account_id),
-                    "refresh_token": "refresh-token",
-                    "account_id": account_id,
+                    "access_token": f"e30.{payload.decode()}.signature",
+                    "refresh_token": "synthetic-refresh-token",
+                    "account_id": "acct_test",
                 },
             }
         )
@@ -49,394 +38,470 @@ def make_auth_storage(tmp_path, account_id: str = "acct_test") -> CodexAuth:
     return CodexAuth(path)
 
 
-class FakeResponsesStream:
-    def __init__(self, events: list[SimpleNamespace], response: SimpleNamespace):
-        self._events = events
-        self.completed_response = SimpleNamespace(response=response)
-
-    def __iter__(self):
-        return iter(self._events)
-
-
-class RemoteProtocolError(Exception):
-    pass
-
-
-class BrokenResponsesStream:
-    def __init__(self):
-        self.completed_response = SimpleNamespace(response=make_response())
-
-    def __iter__(self):
-        raise RemoteProtocolError(
-            "peer closed connection without sending complete message body"
-        )
-
-
-class CompletedResponseLoggingErrorStream:
-    def __init__(self):
-        self.completed_response = SimpleNamespace(response=make_response_dict())
-
-    def __iter__(self):
-        yield SimpleNamespace(
-            type="response.output_text.done",
-            output_index=0,
-            content_index=0,
-            text="hello despite logging error",
-        )
-        raise AttributeError("'dict' object has no attribute 'usage'")
-
-
-class AsyncCompletedResponseLoggingErrorStream:
-    def __init__(self):
-        self.completed_response = SimpleNamespace(response=make_response_dict())
-
-    async def __aiter__(self):
-        yield SimpleNamespace(
-            type="response.output_text.done",
-            output_index=0,
-            content_index=0,
-            text="hello despite async logging error",
-        )
-        raise AttributeError("'dict' object has no attribute 'usage'")
-
-
-def make_response(output=None) -> SimpleNamespace:
-    return SimpleNamespace(
-        output=output or [], model="gpt-5.5", usage={}, _hidden_params={}
+def make_response(text="ok", *, output=None, usage=None, transport="http"):
+    return CodexResponse(
+        response={
+            "id": "resp_test",
+            "model": "gpt-5.5-actual",
+            "status": "completed",
+            "output": output
+            if output is not None
+            else [
+                {
+                    "type": "message",
+                    "id": "msg_test",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text}],
+                }
+            ],
+            "usage": usage,
+            "metadata": {"trace": "kept"},
+        },
+        transport=transport,
     )
 
 
-def make_response_dict(output=None) -> dict:
-    return {
-        "output": output or [],
-        "model": "gpt-5.5",
-        "usage": {},
-        "_hidden_params": {},
-    }
-
-
-class FakeUsageTracker:
-    def __init__(self):
-        self.calls = []
-
-    def add_usage(self, model, usage):
-        self.calls.append((model, usage))
-
-
-def test_forward_skips_usage_tracking_when_usage_is_none(monkeypatch):
-    result = SimpleNamespace(output=[], model="gpt-5.4", usage=None, _hidden_params={})
-
-    def fake_get_cached_completion_fn(fn, cache):
-        def completion(**kwargs):
-            return result
-
-        return completion, {"no-cache": True}
-
-    lm = dspy_codex_auth.LM(
-        "openai/gpt-5.4",
-        auth_provider="codex",
-        api_key="dummy",
-        chatgpt_account_id="acct_test",
-        cache=False,
+def make_lm(**kwargs):
+    return dspy_codex_auth.LM(
+        "codex/gpt-5.5",
+        **{
+            "api_key": "synthetic-key",
+            "chatgpt_account_id": "acct_test",
+            "cache": False,
+            **kwargs,
+        },
     )
-    monkeypatch.setattr(lm, "_get_cached_completion_fn", fake_get_cached_completion_fn)
-
-    tracker = FakeUsageTracker()
-    with dspy.context(usage_tracker=tracker):
-        returned = lm.forward(prompt="hello")
-
-    assert returned is result
-    assert returned.usage == {}
-    assert tracker.calls == []
 
 
-def test_aforward_skips_usage_tracking_when_usage_is_none(monkeypatch):
-    result = SimpleNamespace(output=[], model="gpt-5.4", usage=None, _hidden_params={})
-
-    def fake_get_cached_completion_fn(fn, cache):
-        async def completion(**kwargs):
-            return result
-
-        return completion, {"no-cache": True}
-
-    lm = dspy_codex_auth.LM(
-        "openai/gpt-5.4",
-        auth_provider="codex",
-        api_key="dummy",
-        chatgpt_account_id="acct_test",
-        cache=False,
+@pytest.fixture
+def client_calls(monkeypatch):
+    calls = SimpleNamespace(
+        constructors=[], sync=[], async_=[], response=make_response()
     )
-    monkeypatch.setattr(lm, "_get_cached_completion_fn", fake_get_cached_completion_fn)
 
-    tracker = FakeUsageTracker()
+    class FakeClient:
+        def __init__(self, **kwargs):
+            calls.constructors.append(kwargs)
 
-    async def run():
-        with dspy.context(usage_tracker=tracker):
-            return await lm.aforward(prompt="hello")
+        def create(self, **kwargs):
+            calls.sync.append(kwargs)
+            return calls.response
 
-    returned = asyncio.run(run())
-    assert returned is result
-    assert returned.usage == {}
-    assert tracker.calls == []
+        async def acreate(self, **kwargs):
+            calls.async_.append(kwargs)
+            return calls.response
+
+    monkeypatch.setattr(codex_lm, "CodexClient", FakeClient)
+    return calls
 
 
-def test_install_patches_dspy_lm(tmp_path):
+def test_install_routes_to_shared_client_without_eager_auth(tmp_path, client_calls):
     storage = make_auth_storage(tmp_path)
     original_lm = dspy.LM
-
     try:
         dspy_codex_auth.install(auth_storage=storage)
         assert dspy.LM is dspy_codex_auth.LM
         lm = dspy.LM("codex/gpt-5.5", cache=False)
-        assert isinstance(lm, dspy_codex_auth.LM)
         assert lm.model == "openai/gpt-5.5"
+        assert "api_key" not in lm.kwargs
+        assert "headers" not in lm.kwargs
+        lm("hello")
+        constructor = client_calls.constructors[0]
+        assert constructor["auth"] is storage
+        assert constructor["api_key"] is None
+        assert constructor["account_id"] is None
+        assert constructor["originator"] == "dspy_codex_auth"
+        assert constructor["user_agent"] == f"DSPy/{dspy.__version__}"
     finally:
         dspy_codex_auth.uninstall()
         assert dspy.LM is original_lm
 
 
-def test_explicit_codex_auth_provider_sets_codex_originator(tmp_path):
-    storage = make_auth_storage(tmp_path)
+@pytest.mark.parametrize("alias", ["codex", "chatgpt", "openai-codex"])
+def test_route_aliases_use_shared_client(alias, client_calls):
+    lm = dspy_codex_auth.LM(f"{alias}/gpt-5.5", api_key="synthetic", cache=False)
+    lm("hello")
+    assert client_calls.sync[0]["model"] == "gpt-5.5"
 
+
+def test_explicit_auth_provider_passes_overrides(client_calls):
     lm = dspy_codex_auth.LM(
         "openai/gpt-5.5",
         auth_provider="codex",
-        auth_storage=storage,
+        api_key="override-key",
+        chatgpt_account_id="override-account",
+        originator="custom-originator",
+        headers={"X-Test": "custom"},
         cache=False,
     )
-
-    assert lm._uses_codex_route is True
-    assert lm.kwargs["headers"]["originator"] == "dspy_codex_auth"
-
-
-def test_codex_request_strips_token_caps_and_accepts_reasoning_summary():
-    request = codex_lm._build_codex_request(
-        {
-            "model": "openai/gpt-5.5",
-            "messages": [{"role": "user", "content": "hello"}],
-            "max_tokens": 100,
-            "max_output_tokens": 100,
-            "max_completion_tokens": 100,
-            "reasoning_effort": "medium",
-            "reasoning_summary": "detailed",
-        }
+    lm.forward(prompt="hello", api_key="per-call-key")
+    constructor = client_calls.constructors[0]
+    assert constructor["api_key"] == "per-call-key"
+    assert constructor["account_id"] == "override-account"
+    assert constructor["headers"] == {"X-Test": "custom"}
+    assert constructor["originator"] == "custom-originator"
+    assert (
+        not {"api_key", "chatgpt_account_id", "headers", "originator", "api_base"}
+        & client_calls.sync[0].keys()
     )
 
-    assert "max_tokens" not in request
-    assert "max_output_tokens" not in request
-    assert "max_completion_tokens" not in request
+
+def test_sync_and_async_use_matching_shared_client_methods(client_calls):
+    lm = make_lm()
+    assert lm("sync") == [{"text": "ok"}]
+    assert asyncio.run(lm.acall("async")) == [{"text": "ok"}]
+    assert len(client_calls.sync) == len(client_calls.async_) == 1
+    assert client_calls.sync[0]["input"][0]["content"][0]["text"] == "sync"
+    assert client_calls.async_[0]["input"][0]["content"][0]["text"] == "async"
+    assert all(
+        call["model"] == "gpt-5.5" for call in client_calls.sync + client_calls.async_
+    )
+
+
+def test_shared_response_preserves_usage_model_metadata_and_history(client_calls):
+    usage = {"input_tokens": 12, "output_tokens": 7, "total_tokens": 19}
+    client_calls.response = make_response(usage=usage, transport="websocket")
+    tracker = SimpleNamespace(calls=[])
+    tracker.add_usage = lambda model, value: tracker.calls.append((model, value))
+    lm = make_lm()
+    with dspy.context(usage_tracker=tracker):
+        assert lm("hello") == [{"text": "ok"}]
+    assert tracker.calls == [("openai/gpt-5.5", usage)]
+    entry = lm.history[-1]
+    assert entry["usage"] == usage
+    assert entry["response_model"] == "gpt-5.5-actual"
+    assert entry["response"].metadata == {"trace": "kept"}
+    assert entry["response"].codex_transport == "websocket"
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_missing_usage_is_empty_for_dspy(client_calls, asynchronous):
+    lm = make_lm()
+    tracker = SimpleNamespace(add_usage=lambda *_: pytest.fail("no usage to record"))
+    with dspy.context(usage_tracker=tracker):
+        if asynchronous:
+            result = asyncio.run(lm.aforward(prompt="hello"))
+        else:
+            result = lm.forward(prompt="hello")
+    assert result.usage == {}
+
+
+def test_request_options_translate_to_native_fields(client_calls):
+    lm = make_lm(
+        reasoning_effort="medium",
+        reasoning_summary="detailed",
+        service_tier="fast",
+        max_tokens=18000,
+        num_retries=2,
+    )
+    lm.forward(prompt="hello", rollout_id=7)
+    request = client_calls.sync[0]
     assert request["reasoning"] == {"effort": "medium", "summary": "detailed"}
-
-
-def test_codex_request_normalizes_fast_service_tier_to_priority():
-    request = codex_lm._build_codex_request(
-        {
-            "model": "openai/gpt-5.4",
-            "messages": [{"role": "user", "content": "hello"}],
-            "service_tier": "fast",
+    assert request["max_output_tokens"] == 18000
+    assert (
+        request["service_tier"] == "fast"
+    )  # Backend normalization belongs to the core.
+    assert request["max_retries"] == 2
+    assert request["transport"] == "auto"
+    assert request["instructions"] == dspy_codex_auth.DEFAULT_CODEX_INSTRUCTIONS
+    assert (
+        not {
+            "messages",
+            "max_tokens",
+            "max_completion_tokens",
+            "rollout_id",
+            "stream",
+            "store",
+            "model_type",
+            "use_developer_role",
+            "reasoning_effort",
+            "reasoning_summary",
         }
+        & request.keys()
     )
 
-    assert request["service_tier"] == "priority"
 
-
-def test_codex_request_accepts_codex_config_reasoning_aliases():
-    request = codex_lm._build_codex_request(
-        {
-            "model": "openai/gpt-5.4",
-            "messages": [{"role": "user", "content": "hello"}],
-            "model_reasoning_effort": "low",
-            "model_reasoning_summary": "concise",
-        }
-    )
-
+def test_codex_config_reasoning_options_are_translated(client_calls):
+    make_lm(model_reasoning_effort="low", model_reasoning_summary="concise")("hello")
+    request = client_calls.sync[0]
+    assert request["reasoning"] == {"effort": "low", "summary": "concise"}
     assert "model_reasoning_effort" not in request
     assert "model_reasoning_summary" not in request
-    assert request["reasoning"] == {"effort": "low", "summary": "concise"}
 
 
-def test_codex_request_encodes_assistant_messages_as_output_text():
-    request = codex_lm._build_codex_request(
-        {
-            "model": "openai/gpt-5.5",
-            "messages": [
-                {"role": "system", "content": "Follow the schema."},
-                {
-                    "role": "user",
-                    "content": [{"type": "text", "text": "question"}],
-                },
-                {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "text", "text": "answer"},
-                        {"type": "input_text", "text": "more answer"},
-                    ],
-                },
-                {
-                    "role": "user",
-                    "content": [{"type": "output_text", "text": "followup"}],
-                },
-            ],
-        }
+def test_native_reasoning_and_text_options_preserved(client_calls):
+    make_lm(reasoning={"effort": "high"}, text={"verbosity": "low"})("hello")
+    assert client_calls.sync[0]["reasoning"] == {"effort": "high"}
+    assert client_calls.sync[0]["text"] == {"verbosity": "low"}
+
+
+def test_pydantic_response_format_converts_to_native_json_schema(client_calls):
+    class Answer(BaseModel):
+        answer: str
+
+    make_lm()("hello", response_format=Answer, text={"verbosity": "low"})
+    assert client_calls.sync[0]["text"] == {
+        "verbosity": "low",
+        "format": {
+            "name": "Answer",
+            "type": "json_schema",
+            "schema": Answer.model_json_schema(),
+        },
+    }
+    assert "response_format" not in client_calls.sync[0]
+
+
+def test_json_adapter_predict_uses_shared_client(client_calls):
+    client_calls.response = make_response('{"answer":"four"}')
+    with dspy.context(lm=make_lm(), adapter=dspy.JSONAdapter()):
+        prediction = dspy.Predict("question -> answer")(question="2+2?")
+    assert prediction.answer == "four"
+    assert client_calls.sync
+    assert client_calls.sync[0]["text"]["format"]["type"] in {
+        "json_schema",
+        "json_object",
+    }
+
+
+def test_codex_request_encodes_assistant_messages_and_media(client_calls):
+    make_lm().forward(
+        messages=[
+            {"role": "system", "content": "Follow the schema."},
+            {"role": "developer", "content": "Be concise."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "question"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.invalid/image.png"},
+                    },
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "answer"},
+                    {"type": "input_text", "text": "more answer"},
+                ],
+            },
+            {"role": "user", "content": [{"type": "output_text", "text": "followup"}]},
+        ]
+    )
+    request = client_calls.sync[0]
+    assert request["instructions"] == "Follow the schema.\n\nBe concise."
+    assert request["input"][0]["content"] == [
+        {"type": "input_text", "text": "question"},
+        {"type": "input_image", "image_url": "https://example.invalid/image.png"},
+    ]
+    assert request["input"][1]["content"] == [
+        {"type": "output_text", "text": "answer"},
+        {"type": "output_text", "text": "more answer"},
+    ]
+    assert request["input"][2]["content"] == [
+        {"type": "input_text", "text": "followup"}
+    ]
+
+
+def test_function_calls_and_reasoning_are_compatible_with_dspy(client_calls):
+    function_call = {
+        "type": "function_call",
+        "id": "fc_test",
+        "call_id": "call_test",
+        "name": "lookup_weather",
+        "arguments": '{"city":"Chicago"}',
+        "status": "completed",
+    }
+    client_calls.response = make_response(
+        output=[
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "Need weather."}],
+            },
+            function_call,
+        ]
+    )
+    output = make_lm()("hello")[0]
+    assert output["tool_calls"][0]["name"] == "lookup_weather"
+    assert output["tool_calls"][0]["call_id"] == "call_test"
+    assert output["tool_calls"][0]["arguments"] == '{"city":"Chicago"}'
+    assert output["reasoning_content"] == "Need weather."
+
+
+def test_transport_overrides_and_timeout_precedence(client_calls):
+    lm = make_lm(codex_transport="websocket", timeout=600)
+    lm.forward(
+        prompt="one",
+        codex_transport="http",
+        codex_websocket_connect_timeout=21,
+        codex_websocket_idle_timeout=22,
+    )
+    lm.forward(prompt="two", codex_websocket_idle_timeout=23, timeout=700)
+    lm.forward(prompt="three")
+    lm.forward(prompt="four", timeout=None, codex_websocket_idle_timeout=24)
+    assert [
+        (c["transport"], c["connect_timeout"], c["idle_timeout"], c.get("timeout"))
+        for c in client_calls.sync
+    ] == [
+        ("http", 21.0, 22.0, 600),
+        ("websocket", 10.0, 700.0, 700),
+        ("websocket", 10.0, 600.0, 600),
+        ("websocket", 10.0, 24.0, None),
+    ]
+
+
+def test_async_timeout_and_transport_overrides(client_calls):
+    asyncio.run(
+        make_lm().aforward(
+            prompt="hello",
+            codex_transport="websocket",
+            codex_websocket_connect_timeout=12,
+            timeout=620,
+        )
+    )
+    call = client_calls.async_[0]
+    assert call["transport"] == "websocket"
+    assert call["connect_timeout"] == 12.0
+    assert call["idle_timeout"] == call["timeout"] == 620.0
+
+
+def test_http_preserves_structured_timeout(client_calls):
+    timeout = httpx.Timeout(600, connect=8, pool=9)
+    make_lm(codex_transport="http").forward(prompt="hello", timeout=timeout)
+    assert client_calls.sync[0]["timeout"] is timeout
+
+
+def test_real_cache_separates_transport_and_deadlines(client_calls):
+    lm = make_lm(cache=True)
+    prompt = f"cache transport {time.time_ns()}"
+    lm(prompt, codex_transport="http")
+    lm(prompt, codex_transport="websocket")
+    lm(prompt, codex_transport="websocket", codex_websocket_connect_timeout=11)
+    lm(prompt, codex_transport="websocket", codex_websocket_idle_timeout=301)
+    lm(prompt, codex_transport="http")
+    assert [
+        (c["transport"], c["connect_timeout"], c["idle_timeout"])
+        for c in client_calls.sync
+    ] == [
+        ("http", 10.0, 300.0),
+        ("websocket", 10.0, 300.0),
+        ("websocket", 11.0, 300.0),
+        ("websocket", 10.0, 301.0),
+    ]
+
+
+def test_uncached_calls_reuse_auth_source_not_a_token_snapshot(tmp_path, client_calls):
+    storage = make_auth_storage(tmp_path)
+    lm = dspy_codex_auth.LM("codex/gpt-5.5", auth_storage=storage, cache=False)
+    lm("first")
+    lm("second")
+    assert len(client_calls.constructors) == 2
+    assert all(
+        c["auth"] is storage and c["api_key"] is None for c in client_calls.constructors
     )
 
-    assert request["instructions"] == "Follow the schema."
-    assert request["input"][0] == {
-        "role": "user",
-        "content": [{"type": "input_text", "text": "question"}],
-    }
-    assert request["input"][1] == {
-        "role": "assistant",
-        "content": [
-            {"type": "output_text", "text": "answer"},
-            {"type": "output_text", "text": "more answer"},
+
+@pytest.mark.parametrize("transport", ["invalid", 1, None])
+def test_constructor_rejects_invalid_transport(transport):
+    with pytest.raises(ValueError, match="auto.*http.*websocket"):
+        make_lm(codex_transport=transport)
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), True])
+def test_constructor_rejects_invalid_websocket_timeouts(timeout):
+    with pytest.raises(ValueError, match="positive finite"):
+        make_lm(codex_websocket_connect_timeout=timeout)
+
+
+def test_invalid_per_call_transport_fails_before_client(client_calls):
+    with pytest.raises(ValueError, match="auto.*http.*websocket"):
+        make_lm().forward(prompt="hello", codex_transport="invalid")
+    assert not client_calls.constructors
+
+
+def test_non_codex_route_uses_standard_dspy_sync_and_async(monkeypatch, client_calls):
+    calls = []
+    result = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="ok", tool_calls=None), logprobs=None
+            )
         ],
-    }
-    assert request["input"][2] == {
-        "role": "user",
-        "content": [{"type": "input_text", "text": "followup"}],
-    }
+        model="fake",
+        usage={},
+    )
+
+    def forward(self, prompt=None, messages=None, **kwargs):
+        calls.append(("sync", prompt, kwargs))
+        return result
+
+    async def aforward(self, prompt=None, messages=None, **kwargs):
+        calls.append(("async", prompt, kwargs))
+        return result
+
+    monkeypatch.setattr(codex_lm._DSPY_LM, "forward", forward)
+    monkeypatch.setattr(codex_lm._DSPY_LM, "aforward", aforward)
+    lm = dspy_codex_auth.LM(
+        "openai/test", api_key="synthetic", api_base="http://example.invalid"
+    )
+    assert lm("hello", temperature=0.3) == ["ok"]
+    assert asyncio.run(lm.acall("async", temperature=0.4)) == ["ok"]
+    assert calls == [
+        ("sync", "hello", {"temperature": 0.3}),
+        ("async", "async", {"temperature": 0.4}),
+    ]
+    assert not client_calls.constructors
 
 
-def test_labeled_fewshot_demos_build_valid_codex_responses_request():
-    from dspy.adapters import ChatAdapter
+def test_non_codex_route_rejects_codex_transport_overrides():
+    with pytest.raises(ValueError, match="require a Codex LM route"):
+        dspy_codex_auth.LM(
+            "openai/test", api_key="synthetic", codex_transport="websocket"
+        )
+    lm = dspy_codex_auth.LM("openai/test", api_key="synthetic")
+    with pytest.raises(ValueError, match="require a Codex LM route"):
+        lm.forward("hello", codex_transport="websocket")
+    with pytest.raises(ValueError, match="require a Codex LM route"):
+        asyncio.run(lm.aforward("hello", codex_websocket_idle_timeout=22))
+
+
+def test_labeled_fewshot_demos_reach_shared_client_as_output_text(client_calls):
     from dspy.teleprompt import LabeledFewShot
 
-    class QA(dspy.Signature):
-        question: str = dspy.InputField()
-        answer: str = dspy.OutputField()
-
-    trainset = [
-        dspy.Example(question="2+2?", answer="4").with_inputs("question"),
-    ]
-    compiled = LabeledFewShot(k=1).compile(
-        dspy.Predict(QA),
-        trainset=trainset,
-        sample=False,
+    student = dspy.Predict("question -> answer")
+    trainset = [dspy.Example(question="2+2?", answer="4").with_inputs("question")]
+    compiled = LabeledFewShot(k=1).compile(student, trainset=trainset, sample=False)
+    client_calls.response = make_response(
+        "[[ ## answer ## ]]\n6\n\n[[ ## completed ## ]]"
     )
-    predictor = compiled.predictors()[0]
-    messages = ChatAdapter().format(
-        predictor.signature,
-        predictor.demos,
-        {"question": "3+3?"},
-    )
-
-    assert any(message["role"] == "assistant" for message in messages)
-
-    request = codex_lm._build_codex_request(
-        {"model": "openai/gpt-5.5", "messages": messages}
-    )
-
+    with dspy.context(lm=make_lm(), adapter=dspy.ChatAdapter()):
+        prediction = compiled(question="3+3?")
+    assert prediction.answer == "6"
     assistant_messages = [
-        message for message in request["input"] if message["role"] == "assistant"
+        item for item in client_calls.sync[0]["input"] if item["role"] == "assistant"
     ]
     assert assistant_messages
-    for message in assistant_messages:
-        assert message["content"]
-        assert all(block["type"] != "input_text" for block in message["content"])
-
-
-def test_codex_completion_retries_empty_stream_output(monkeypatch):
-    calls = 0
-
-    def fake_responses(**kwargs):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            return FakeResponsesStream(events=[], response=make_response())
-        return FakeResponsesStream(
-            events=[
-                SimpleNamespace(
-                    type="response.output_text.done",
-                    output_index=0,
-                    content_index=0,
-                    text="ok",
-                )
-            ],
-            response=make_response(),
-        )
-
-    monkeypatch.setattr(codex_lm.litellm, "responses", fake_responses)
-
-    response = codex_lm._codex_responses_completion(
-        {"model": "openai/gpt-5.5", "messages": [{"role": "user", "content": "hi"}]},
-        num_retries=1,
+    assert all(
+        block["type"] == "output_text"
+        for item in assistant_messages
+        for block in item["content"]
     )
 
-    assert calls == 2
-    assert response.output[0].content[0].text == "ok"
 
-
-def test_codex_completion_retries_stream_protocol_errors(monkeypatch):
-    calls = 0
-
-    def fake_responses(**kwargs):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            return BrokenResponsesStream()
-        return FakeResponsesStream(
-            events=[
-                SimpleNamespace(
-                    type="response.output_text.done",
-                    output_index=0,
-                    content_index=0,
-                    text="ok",
-                )
-            ],
-            response=make_response(),
-        )
-
-    monkeypatch.setattr(codex_lm.litellm, "responses", fake_responses)
-
-    response = codex_lm._codex_responses_completion(
-        {"model": "openai/gpt-5.5", "messages": [{"role": "user", "content": "hi"}]},
-        num_retries=1,
-    )
-
-    assert calls == 2
-    assert response.output[0].content[0].text == "ok"
-
-
-def test_gepa_reflection_lm_prompt_path_uses_codex_adapter(monkeypatch):
+def test_gepa_reflection_plain_prompt_uses_shared_client(client_calls):
     from dspy.teleprompt.gepa.gepa_utils import DspyAdapter
 
-    captured_request = {}
-
-    def fake_responses(**kwargs):
-        captured_request.update(kwargs)
-        return FakeResponsesStream(
-            events=[
-                SimpleNamespace(
-                    type="response.output_text.done",
-                    output_index=0,
-                    content_index=0,
-                    text="Use a tighter instruction.",
-                )
-            ],
-            response=make_response(),
-        )
-
-    monkeypatch.setattr(codex_lm.litellm, "responses", fake_responses)
-
-    lm = dspy_codex_auth.LM(
-        "openai/gpt-5.5",
-        auth_provider="codex",
-        api_key="dummy",
-        chatgpt_account_id="acct_test",
-        cache=False,
-    )
+    client_calls.response = make_response("Use a tighter instruction.")
     adapter = DspyAdapter(
         student_module=dspy.Predict("question -> answer"),
         metric_fn=lambda *args: 1.0,
         feedback_map={},
-        reflection_lm=lm,
+        reflection_lm=make_lm(),
     )
-
     assert adapter.stripped_lm_call("Reflect on this trajectory.") == [
         "Use a tighter instruction."
     ]
-    assert captured_request["input"] == [
+    assert client_calls.sync[0]["input"] == [
         {
             "role": "user",
             "content": [{"type": "input_text", "text": "Reflect on this trajectory."}],
@@ -444,48 +509,26 @@ def test_gepa_reflection_lm_prompt_path_uses_codex_adapter(monkeypatch):
     ]
 
 
-def test_gepa_compile_smoke_uses_codex_lm_without_extra_patches(monkeypatch):
+def test_gepa_compile_uses_shared_client_without_extra_patches(monkeypatch):
     from dspy.teleprompt import GEPA
 
     captured_inputs = []
 
-    def fake_responses(**kwargs):
+    def create(self, **kwargs):
         captured_inputs.append(kwargs["input"])
         input_text = "\n".join(
             block.get("text", "")
-            for message in kwargs["input"]
-            for block in message["content"]
-            if isinstance(block, dict)
+            for item in kwargs["input"]
+            for block in item["content"]
         )
         if "Your task is to write a new instruction" in input_text:
-            text = (
-                "```Given the fields `question`, produce the fields `answer`. "
-                "Return exactly the expected answer.```"
-            )
+            text = "```Given the fields `question`, produce the fields `answer`. Return exactly the expected answer.```"
         else:
             text = "[[ ## answer ## ]]\n4\n\n[[ ## completed ## ]]"
+        return make_response(text)
 
-        return FakeResponsesStream(
-            events=[
-                SimpleNamespace(
-                    type="response.output_text.done",
-                    output_index=0,
-                    content_index=0,
-                    text=text,
-                )
-            ],
-            response=make_response(),
-        )
-
-    monkeypatch.setattr(codex_lm.litellm, "responses", fake_responses)
-
-    lm = dspy_codex_auth.LM(
-        "openai/gpt-5.5",
-        auth_provider="codex",
-        api_key="dummy",
-        chatgpt_account_id="acct_test",
-        cache=False,
-    )
+    monkeypatch.setattr(codex_lm.CodexClient, "create", create)
+    lm = make_lm()
     student = dspy.Predict("question -> answer")
     trainset = [dspy.Example(question="2+2?", answer="4").with_inputs("question")]
 
@@ -502,860 +545,161 @@ def test_gepa_compile_smoke_uses_codex_lm_without_extra_patches(monkeypatch):
         add_format_failure_as_feedback=True,
         num_threads=1,
     )
-
     with dspy.context(lm=lm, adapter=dspy.ChatAdapter()):
         compiled = optimizer.compile(student, trainset=trainset, valset=trainset)
-
     assert compiled.signature.instructions
     assert captured_inputs
-    assert all(
-        block["type"] == "input_text"
-        for input_messages in captured_inputs
-        for message in input_messages
-        for block in message["content"]
-        if "text" in block
-    )
 
 
-def test_stream_reconstructs_message_from_output_item_done():
-    stream = FakeResponsesStream(
-        events=[
-            SimpleNamespace(
-                type="response.output_item.done",
-                output_index=0,
-                item=SimpleNamespace(
-                    type="message",
-                    content=[{"type": "output_text", "text": "hello"}],
-                ),
-            )
+def test_chat_tool_continuation_and_declarations_become_native_responses(client_calls):
+    function = {
+        "name": "lookup_weather",
+        "description": "Weather",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+        "strict": True,
+    }
+    make_lm().forward(
+        messages=[
+            {"role": "user", "content": "Weather in Chicago?"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_weather",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup_weather",
+                            "arguments": '{"city":"Chicago"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_weather",
+                "content": '{"temperature":72}',
+            },
         ],
-        response=make_response(),
+        tools=[{"type": "function", "function": function}, {"type": "web_search"}],
+        tool_choice={"type": "function", "function": {"name": "lookup_weather"}},
     )
-
-    response = codex_lm._consume_codex_response_stream(stream)
-
-    assert response.output[0].type == "message"
-    assert response.output[0].content[0].text == "hello"
-
-
-def test_stream_reconstructs_message_from_text_done_when_output_item_is_empty():
-    stream = FakeResponsesStream(
-        events=[
-            SimpleNamespace(
-                type="response.output_item.done",
-                output_index=0,
-                item=SimpleNamespace(type="message", content=[]),
-            ),
-            SimpleNamespace(
-                type="response.output_text.done",
-                output_index=0,
-                content_index=0,
-                text="hello from done",
-            ),
-        ],
-        response=make_response(),
-    )
-
-    response = codex_lm._consume_codex_response_stream(stream)
-
-    assert response.output[0].content[0].text == "hello from done"
-
-
-def test_stream_reconstructs_message_from_deltas():
-    stream = FakeResponsesStream(
-        events=[
-            SimpleNamespace(
-                type="response.output_text.delta",
-                output_index=0,
-                content_index=0,
-                delta="hel",
-            ),
-            SimpleNamespace(
-                type="response.output_text.delta",
-                output_index=0,
-                content_index=0,
-                delta="lo",
-            ),
-        ],
-        response=make_response(),
-    )
-
-    response = codex_lm._consume_codex_response_stream(stream)
-
-    assert response.output[0].content[0].text == "hello"
-
-
-def test_stream_preserves_reasoning_summary():
-    stream = FakeResponsesStream(
-        events=[
-            SimpleNamespace(
-                type="response.reasoning_summary_text.done",
-                output_index=0,
-                summary_index=0,
-                text="Used the normal CDF difference.",
-            ),
-            SimpleNamespace(
-                type="response.output_text.done",
-                output_index=1,
-                content_index=0,
-                text="0.4332",
-            ),
-        ],
-        response=make_response(),
-    )
-
-    response = codex_lm._consume_codex_response_stream(stream)
-    lm = dspy_codex_auth.LM(
-        "openai/gpt-5.5", api_key="dummy", api_base="http://example.invalid"
-    )
-    lm.model_type = "responses"
-
-    outputs = lm._process_lm_response(response, prompt="x", messages=None)
-
-    assert outputs == [
+    request = client_calls.sync[0]
+    assert request["input"][1:] == [
         {
-            "reasoning_content": "Used the normal CDF difference.",
-            "text": "0.4332",
-        }
+            "type": "function_call",
+            "call_id": "call_weather",
+            "name": "lookup_weather",
+            "arguments": '{"city":"Chicago"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_weather",
+            "output": '{"temperature":72}',
+        },
     ]
+    assert request["tools"] == [
+        {"type": "function", **function},
+        {"type": "web_search"},
+    ]
+    assert request["tool_choice"] == {"type": "function", "name": "lookup_weather"}
 
 
-def test_stream_recovers_after_completed_response_logging_usage_shape_error():
-    stream = CompletedResponseLoggingErrorStream()
-
-    response = codex_lm._consume_codex_response_stream(stream)
-
-    assert response.output[0].content[0].text == "hello despite logging error"
-
-
-def test_async_stream_recovers_after_completed_response_logging_usage_shape_error():
-    stream = AsyncCompletedResponseLoggingErrorStream()
-
-    response = asyncio.run(codex_lm._aconsume_codex_response_stream(stream))
-
-    assert response.output[0].content[0].text == "hello despite async logging error"
+def test_chat_json_schema_format_becomes_native_text_format(client_calls):
+    schema = {
+        "name": "Answer",
+        "schema": {"type": "object", "properties": {"answer": {"type": "string"}}},
+        "strict": True,
+    }
+    make_lm()("hello", response_format={"type": "json_schema", "json_schema": schema})
+    assert client_calls.sync[0]["text"]["format"] == {"type": "json_schema", **schema}
 
 
-def test_non_codex_routes_fall_through(monkeypatch):
-    called = {}
+def test_provider_refusal_is_reported_instead_of_returning_empty_output(client_calls):
+    from openai_codex_auth import CodexError
 
-    def fake_forward(self, prompt=None, messages=None, **kwargs):
-        called["prompt"] = prompt
-        return SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(content="ok", tool_calls=None),
-                    logprobs=None,
-                )
-            ],
-            model="fake",
-            usage={},
-        )
-
-    monkeypatch.setattr(codex_lm._DSPY_LM, "forward", fake_forward)
-
-    lm = dspy_codex_auth.LM(
-        "openai/test", api_key="dummy", api_base="http://example.invalid"
-    )
-    assert lm("hello") == ["ok"]
-    assert called["prompt"] == "hello"
-
-
-def make_model_not_found_error(
-    model: str = "gpt-5.6-luna",
-    *,
-    status_code: int = 404,
-    provider: str = "openai",
-    error_message: str | None = None,
-    error_type: str = "invalid_request_error",
-    param: str = "model",
-    code=None,
-    structured: bool = True,
-    message_prefix: str = "OpenAIException - ",
-    top_level_extra: dict | None = None,
-    error_extra: dict | None = None,
-    attach_body: bool = False,
-):
-    if structured:
-        payload = {
-            "error": {
-                "message": error_message or f"Model not found {model}",
-                "type": error_type,
-                "param": param,
-                "code": code,
-            }
-        }
-        payload["error"].update(error_extra or {})
-        payload.update(top_level_extra or {})
-        message = f"{message_prefix}{json.dumps(payload)}"
-    else:
-        message = error_message or f"Model not found {model}"
-    error = codex_lm.litellm.BadRequestError(
-        message=message,
-        model=model,
-        llm_provider=provider,
-    )
-    error.status_code = status_code
-    if attach_body:
-        error.body = payload
-    return error
-
-
-def make_text_response(text: str = "ok") -> SimpleNamespace:
-    return make_response(
+    client_calls.response = make_response(
         output=[
-            SimpleNamespace(
-                type="message",
-                content=[SimpleNamespace(text=text)],
-            )
+            {
+                "type": "message",
+                "content": [
+                    {"type": "refusal", "refusal": "Cannot fulfill this request."}
+                ],
+            }
         ]
     )
-
-
-def dispatch_kwargs(transport: str = "auto") -> dict:
-    return {
-        "request": {
-            "model": "openai/gpt-5.6-luna",
-            "messages": [{"role": "user", "content": "hi"}],
-        },
-        "num_retries": 0,
-        "codex_transport": transport,
-        "codex_websocket_connect_timeout": 10.0,
-        "codex_websocket_idle_timeout": 300.0,
-    }
-
-
-def test_codex_transport_constructor_defaults_and_validates():
-    lm = dspy_codex_auth.LM(
-        "openai/gpt-5.6-luna",
-        auth_provider="codex",
-        api_key="dummy",
-        chatgpt_account_id="acct_test",
-        cache=False,
-    )
-
-    assert lm.codex_transport == "auto"
-    assert (
-        lm.codex_websocket_connect_timeout
-        == dspy_codex_auth.DEFAULT_CODEX_WEBSOCKET_CONNECT_TIMEOUT
-    )
-    assert (
-        lm.codex_websocket_idle_timeout
-        == dspy_codex_auth.DEFAULT_CODEX_WEBSOCKET_IDLE_TIMEOUT
-    )
-
-    explicit = dspy_codex_auth.LM(
-        "openai/gpt-5.6-luna",
-        auth_provider="codex",
-        api_key="dummy",
-        chatgpt_account_id="acct_test",
-        codex_transport="websocket",
-        cache=False,
-    )
-    assert explicit.codex_transport == "websocket"
-
-    with pytest.raises(ValueError, match="auto.*http.*websocket"):
-        dspy_codex_auth.LM(
-            "openai/gpt-5.6-luna",
-            auth_provider="codex",
-            api_key="dummy",
-            chatgpt_account_id="acct_test",
-            codex_transport="invalid",
-            cache=False,
-        )
-
-
-def test_non_codex_constructor_rejects_codex_only_transport_settings():
-    with pytest.raises(ValueError, match="require a Codex LM route"):
-        dspy_codex_auth.LM(
-            "openai/test",
-            api_key="dummy",
-            api_base="http://example.invalid",
-            codex_transport="websocket",
-            cache=False,
-        )
-
-
-@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
-def test_codex_transport_constructor_rejects_invalid_timeouts(timeout):
-    with pytest.raises(ValueError, match="positive finite"):
-        dspy_codex_auth.LM(
-            "openai/gpt-5.6-luna",
-            auth_provider="codex",
-            api_key="dummy",
-            chatgpt_account_id="acct_test",
-            codex_websocket_connect_timeout=timeout,
-            cache=False,
-        )
-
-
-def test_forward_per_call_transport_overrides_constructor_and_cache_key(monkeypatch):
-    captured_calls = []
-    lm = dspy_codex_auth.LM(
-        "openai/gpt-5.6-luna",
-        auth_provider="codex",
-        api_key="dummy",
-        chatgpt_account_id="acct_test",
-        codex_transport="websocket",
-        cache=False,
-    )
-
-    def fake_get_cached_completion_fn(fn, cache):
-        assert fn is codex_lm._codex_completion
-
-        def completion(**kwargs):
-            captured_calls.append(kwargs)
-            return make_text_response()
-
-        return completion, {"no-cache": True}
-
-    monkeypatch.setattr(lm, "_get_cached_completion_fn", fake_get_cached_completion_fn)
-
-    lm.forward(
-        prompt="first",
-        codex_transport="http",
-        codex_websocket_connect_timeout=21,
-        codex_websocket_idle_timeout=22,
-    )
-    lm.forward(prompt="second", codex_transport="websocket")
-
-    assert [call["codex_transport"] for call in captured_calls] == [
-        "http",
-        "websocket",
-    ]
-    assert captured_calls[0]["codex_websocket_connect_timeout"] == 21.0
-    assert captured_calls[0]["codex_websocket_idle_timeout"] == 22.0
-    assert "codex_transport" not in captured_calls[0]["request"]
-    assert "codex_websocket_connect_timeout" not in captured_calls[0]["request"]
-    assert "codex_websocket_idle_timeout" not in captured_calls[0]["request"]
-
-
-def test_transport_selection_produces_distinct_real_cache_entries(monkeypatch):
-    calls = []
-    http_response = make_text_response("http")
-    websocket_response = make_text_response("websocket")
-
-    def fake_http(request, num_retries, cache=None):
-        assert "_dspy_codex_transport_controls" not in request
-        calls.append(("http", None, None))
-        return http_response
-
-    def fake_websocket(request, num_retries, connect_timeout, idle_timeout):
-        assert "_dspy_codex_transport_controls" not in request
-        calls.append(("websocket", connect_timeout, idle_timeout))
-        return websocket_response
-
-    monkeypatch.setattr(codex_lm, "_codex_responses_completion", fake_http)
-    monkeypatch.setattr(codex_lm, "_codex_websocket_completion", fake_websocket)
-    lm = dspy_codex_auth.LM(
-        "openai/gpt-5.6-luna",
-        auth_provider="codex",
-        api_key="dummy",
-        chatgpt_account_id="acct_test",
-        cache=True,
-    )
-    prompt = f"cache transport probe {time.time_ns()}"
-
-    first = lm.forward(prompt=prompt, codex_transport="http")
-    second = lm.forward(prompt=prompt, codex_transport="websocket")
-    lm.forward(
-        prompt=prompt,
-        codex_transport="websocket",
-        codex_websocket_connect_timeout=11,
-    )
-    lm.forward(
-        prompt=prompt,
-        codex_transport="websocket",
-        codex_websocket_idle_timeout=301,
-    )
-
-    assert first.output[0].content[0].text == "http"
-    assert second.output[0].content[0].text == "websocket"
-    assert calls == [
-        ("http", None, None),
-        ("websocket", 10.0, 300.0),
-        ("websocket", 11.0, 300.0),
-        ("websocket", 10.0, 301.0),
-    ]
-
-
-def test_forward_rejects_invalid_per_call_transport_before_completion(monkeypatch):
-    lm = dspy_codex_auth.LM(
-        "openai/gpt-5.6-luna",
-        auth_provider="codex",
-        api_key="dummy",
-        chatgpt_account_id="acct_test",
-        cache=False,
-    )
-    monkeypatch.setattr(
-        lm,
-        "_get_cached_completion_fn",
-        lambda *_args: pytest.fail("completion must not be selected"),
-    )
-
-    with pytest.raises(ValueError, match="auto.*http.*websocket"):
-        lm.forward(prompt="hi", codex_transport="invalid")
-
-
-def test_exact_structured_model_not_found_is_detected():
-    error = make_model_not_found_error()
-
-    assert codex_lm._is_exact_codex_model_not_found(error, "openai/gpt-5.6-luna")
+    with pytest.raises(CodexError, match="Codex refused the request: Cannot fulfill"):
+        make_lm()("hello")
 
 
 @pytest.mark.parametrize(
-    "error",
+    "key",
     [
-        make_model_not_found_error(status_code=400),
-        make_model_not_found_error(provider="azure"),
-        make_model_not_found_error(model="gpt-5.6-terra"),
-        make_model_not_found_error(error_message="Model unavailable gpt-5.6-luna"),
-        make_model_not_found_error(error_type="server_error"),
-        make_model_not_found_error(param="deployment"),
-        make_model_not_found_error(code="model_not_found"),
-        make_model_not_found_error(structured=False),
-        make_model_not_found_error(message_prefix="Proxy wrapper - "),
-        make_model_not_found_error(top_level_extra={"request_id": "req_test"}),
-        make_model_not_found_error(error_extra={"retryable": False}),
-        make_model_not_found_error(attach_body=True),
-    ],
-)
-def test_near_miss_model_errors_do_not_trigger_fallback(error):
-    assert not codex_lm._is_exact_codex_model_not_found(error, "openai/gpt-5.6-luna")
-
-
-def test_auto_transport_keeps_http_success(monkeypatch):
-    response = make_text_response("http")
-    calls = []
-
-    def fake_http(request, num_retries, cache=None):
-        calls.append("http")
-        return response
-
-    monkeypatch.setattr(codex_lm, "_codex_responses_completion", fake_http)
-    monkeypatch.setattr(
-        codex_lm,
-        "_codex_websocket_completion",
-        lambda *_args, **_kwargs: pytest.fail("websocket must not be called"),
-    )
-
-    assert codex_lm._codex_completion(**dispatch_kwargs()) is response
-    assert calls == ["http"]
-
-
-def test_auto_transport_falls_back_only_for_exact_model_not_found(monkeypatch):
-    response = make_text_response("websocket")
-    calls = []
-
-    def fake_http(request, num_retries, cache=None):
-        calls.append("http")
-        raise make_model_not_found_error()
-
-    def fake_websocket(request, num_retries, connect_timeout, idle_timeout):
-        calls.append(("websocket", connect_timeout, idle_timeout))
-        return response
-
-    monkeypatch.setattr(codex_lm, "_codex_responses_completion", fake_http)
-    monkeypatch.setattr(codex_lm, "_codex_websocket_completion", fake_websocket)
-
-    assert codex_lm._codex_completion(**dispatch_kwargs()) is response
-    assert calls == ["http", ("websocket", 10.0, 300.0)]
-
-
-def test_auto_transport_propagates_near_miss_without_websocket(monkeypatch):
-    error = make_model_not_found_error(param="deployment")
-
-    def fake_http(request, num_retries, cache=None):
-        raise error
-
-    monkeypatch.setattr(codex_lm, "_codex_responses_completion", fake_http)
-    monkeypatch.setattr(
-        codex_lm,
-        "_codex_websocket_completion",
-        lambda *_args, **_kwargs: pytest.fail("websocket must not be called"),
-    )
-
-    with pytest.raises(codex_lm.litellm.BadRequestError) as caught:
-        codex_lm._codex_completion(**dispatch_kwargs())
-    assert caught.value is error
-
-
-def test_explicit_http_never_falls_back(monkeypatch):
-    error = make_model_not_found_error()
-
-    def fake_http(request, num_retries, cache=None):
-        raise error
-
-    monkeypatch.setattr(codex_lm, "_codex_responses_completion", fake_http)
-    monkeypatch.setattr(
-        codex_lm,
-        "_codex_websocket_completion",
-        lambda *_args, **_kwargs: pytest.fail("websocket must not be called"),
-    )
-
-    with pytest.raises(codex_lm.litellm.BadRequestError) as caught:
-        codex_lm._codex_completion(**dispatch_kwargs("http"))
-    assert caught.value is error
-
-
-def test_explicit_websocket_bypasses_http(monkeypatch):
-    response = make_text_response("websocket")
-    monkeypatch.setattr(
-        codex_lm,
-        "_codex_responses_completion",
-        lambda *_args, **_kwargs: pytest.fail("http must not be called"),
-    )
-    monkeypatch.setattr(
-        codex_lm,
-        "_codex_websocket_completion",
-        lambda *_args, **_kwargs: response,
-    )
-
-    assert codex_lm._codex_completion(**dispatch_kwargs("websocket")) is response
-
-
-def test_async_auto_transport_falls_back_for_exact_model_not_found(monkeypatch):
-    response = make_text_response("websocket")
-    calls = []
-
-    async def fake_http(request, num_retries, cache=None):
-        calls.append("http")
-        raise make_model_not_found_error()
-
-    async def fake_websocket(request, num_retries, connect_timeout, idle_timeout):
-        calls.append("websocket")
-        return response
-
-    monkeypatch.setattr(codex_lm, "_acodex_responses_completion", fake_http)
-    monkeypatch.setattr(codex_lm, "_acodex_websocket_completion", fake_websocket)
-
-    returned = asyncio.run(codex_lm._acodex_completion(**dispatch_kwargs()))
-    assert returned is response
-    assert calls == ["http", "websocket"]
-
-
-def test_websocket_completion_builds_wire_request_and_reconstructs_events(monkeypatch):
-    captured = {}
-
-    def fake_websocket_response(request, **kwargs):
-        captured["request"] = request
-        captured.update(kwargs)
-        return codex_lm.WebSocketResult(
-            events=[
-                {
-                    "type": "response.output_text.done",
-                    "output_index": 0,
-                    "content_index": 0,
-                    "text": "from websocket",
-                },
-                {
-                    "type": "response.completed",
-                    "response": {
-                        "status": "completed",
-                        "model": "gpt-5.6-luna",
-                        "output": [],
-                    },
-                },
-            ],
-            response={
-                "status": "completed",
-                "model": "gpt-5.6-luna",
-                "output": [],
-                "usage": {},
-            },
-        )
-
-    monkeypatch.setattr(codex_lm, "websocket_response", fake_websocket_response)
-
-    response = codex_lm._codex_websocket_completion(
-        {
-            "model": "openai/gpt-5.6-luna",
-            "messages": [{"role": "user", "content": "hi"}],
-            "api_key": "secret-token",
-            "api_base": "https://chatgpt.com/backend-api/codex",
-            "headers": {"chatgpt-account-id": "acct_test"},
-            "model_type": "responses",
-            "use_developer_role": True,
-            "temperature": None,
-        },
-        num_retries=0,
-        connect_timeout=10.0,
-        idle_timeout=300.0,
-    )
-
-    assert response.output[0].content[0].text == "from websocket"
-    assert captured["api_key"] == "secret-token"
-    assert captured["api_base"] == "https://chatgpt.com/backend-api/codex"
-    assert captured["headers"]["User-Agent"].startswith("DSPy/")
-    assert captured["request"]["model"] == "openai/gpt-5.6-luna"
-    assert captured["request"]["stream"] is True
-    assert captured["request"]["store"] is False
-    assert all(value is not None for value in captured["request"].values())
-    for client_key in (
-        "api_key",
-        "api_base",
-        "headers",
         "model_type",
         "use_developer_role",
-    ):
-        assert client_key not in captured["request"]
+        "transport",
+        "connect_timeout",
+        "idle_timeout",
+        "max_retries",
+        "num_retries",
+        "request_timeout",
+        "stream_timeout",
+        "read_timeout",
+        "write_timeout",
+        "pool_timeout",
+        "retry_strategy",
+    ],
+)
+def test_unsupported_client_options_are_rejected_before_client(client_calls, key):
+    with pytest.raises(ValueError, match="Unsupported Codex LM option"):
+        make_lm().forward("hello", **{key: 1})
+    assert not client_calls.constructors
 
 
-def test_websocket_timeout_is_not_serialized_and_overrides_idle_timeout(monkeypatch):
-    class FakeConnection:
-        def __init__(self):
-            self.sent = []
-            self.recv_timeouts = []
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return None
-
-        def send(self, frame):
-            self.sent.append(frame)
-
-        def recv(self, timeout=None):
-            self.recv_timeouts.append(timeout)
-            return json.dumps(
-                {
-                    "type": "response.completed",
-                    "response": {
-                        "status": "completed",
-                        "model": "gpt-5.6-luna",
-                        "output": [
-                            {
-                                "type": "message",
-                                "content": [{"type": "output_text", "text": "ok"}],
-                            }
-                        ],
-                        "usage": {},
-                    },
-                }
-            )
-
-    connection = FakeConnection()
-    monkeypatch.setattr(
-        websocket_module,
-        "_sync_connect",
-        lambda *_args, **_kwargs: connection,
-    )
-
-    lm = dspy_codex_auth.LM(
-        "openai/gpt-5.6-luna",
-        auth_provider="codex",
-        api_key="secret-token",
-        chatgpt_account_id="acct_test",
-        codex_transport="websocket",
-        cache=False,
-    )
-    lm.forward(prompt="hi", timeout=600)
-
-    wire_request = json.loads(connection.sent[0])
-    assert "timeout" not in wire_request
-    assert connection.recv_timeouts == [600.0]
+def test_real_cache_separates_explicit_credentials_and_api_bases(client_calls):
+    prompt = f"cache credentials {time.time_ns()}"
+    make_lm(cache=True, api_key="synthetic-one")(prompt)
+    make_lm(cache=True, api_key="synthetic-two")(prompt)
+    make_lm(
+        cache=True, api_key="synthetic-one", api_base="https://example.invalid/codex"
+    )(prompt)
+    make_lm(cache=True, api_key="synthetic-one")(prompt)
+    assert len(client_calls.sync) == 3
 
 
-def test_per_call_websocket_idle_timeout_overrides_constructor_timeout(monkeypatch):
-    captured = {}
-
-    def fake_websocket_response(request, **kwargs):
-        captured.update(kwargs)
-        return codex_lm.WebSocketResult(
-            events=[],
-            response={
-                "status": "completed",
-                "model": "gpt-5.6-luna",
-                "output": [
-                    {
-                        "type": "message",
-                        "content": [{"type": "output_text", "text": "ok"}],
-                    }
-                ],
-                "usage": {},
-            },
-        )
-
-    monkeypatch.setattr(codex_lm, "websocket_response", fake_websocket_response)
-    lm = dspy_codex_auth.LM(
-        "openai/gpt-5.6-luna",
-        auth_provider="codex",
-        api_key="secret-token",
-        chatgpt_account_id="acct_test",
-        codex_transport="websocket",
-        timeout=600,
-        cache=False,
-    )
-
-    lm.forward(prompt="hi", codex_websocket_idle_timeout=22)
-
-    assert captured["idle_timeout"] == 22.0
-
-
-def test_websocket_strips_explicit_client_transport_kwargs(monkeypatch):
-    captured = {}
-
-    def fake_websocket_response(request, **kwargs):
-        captured["request"] = request
-        return codex_lm.WebSocketResult(
-            events=[],
-            response={
-                "status": "completed",
-                "model": "gpt-5.6-luna",
-                "output": [
-                    {
-                        "type": "message",
-                        "content": [{"type": "output_text", "text": "ok"}],
-                    }
-                ],
-                "usage": {},
-            },
-        )
-
-    monkeypatch.setattr(codex_lm, "websocket_response", fake_websocket_response)
-    client_transport_kwargs = {
-        "timeout": 600,
-        "request_timeout": 601,
-        "stream_timeout": 602,
-        "connect_timeout": 603,
-        "read_timeout": 604,
-        "write_timeout": 605,
-        "pool_timeout": 606,
-        "num_retries": 2,
-        "max_retries": 3,
-        "retry_strategy": "exponential_backoff_retry",
-    }
-
-    codex_lm._codex_websocket_completion(
-        {
-            "model": "openai/gpt-5.6-luna",
-            "messages": [{"role": "user", "content": "hi"}],
-            "api_key": "secret-token",
-            **client_transport_kwargs,
-        },
-        num_retries=0,
-        connect_timeout=10.0,
-        idle_timeout=300.0,
-    )
-
-    assert client_transport_kwargs.keys().isdisjoint(captured["request"])
-
-
-def test_http_route_keeps_timeout_as_litellm_client_kwarg(monkeypatch):
-    captured = {}
-
-    def fake_responses(**kwargs):
-        captured.update(kwargs)
-        return make_text_response("http")
-
-    monkeypatch.setattr(codex_lm.litellm, "responses", fake_responses)
-
-    response = codex_lm._codex_responses_completion(
-        {
-            "model": "openai/gpt-5.6-terra",
-            "messages": [{"role": "user", "content": "hi"}],
-            "timeout": 600,
-        },
-        num_retries=0,
-    )
-
-    assert response.output[0].content[0].text == "http"
-    assert captured["timeout"] == 600
-
-
-def test_public_http_route_preserves_httpx_timeout(monkeypatch):
-    captured = {}
-    timeout = httpx.Timeout(600)
-
-    def fake_responses(**kwargs):
-        captured.update(kwargs)
-        return make_text_response("http")
-
-    monkeypatch.setattr(codex_lm.litellm, "responses", fake_responses)
-    lm = dspy_codex_auth.LM(
-        "openai/gpt-5.6-terra",
-        auth_provider="codex",
-        api_key="secret-token",
-        chatgpt_account_id="acct_test",
-        codex_transport="http",
-        cache=False,
-    )
-
-    response = lm.forward(prompt="hi", timeout=timeout)
-
-    assert response.output[0].content[0].text == "http"
-    assert captured["timeout"] is timeout
-
-
-@pytest.mark.parametrize("function_call_source", ["terminal", "event"])
-def test_websocket_function_calls_are_compatible_with_dspy_processing(
-    monkeypatch,
-    function_call_source,
+def test_real_cache_tracks_account_changes_in_the_same_auth_file(
+    tmp_path, client_calls
 ):
-    function_call = {
-        "type": "function_call",
-        "id": "fc_test",
-        "call_id": "call_test",
-        "name": "lookup_weather",
-        "arguments": '{"city":"Chicago"}',
-        "status": "completed",
-    }
-    terminal_output = [function_call] if function_call_source == "terminal" else []
-    events = []
-    if function_call_source == "event":
-        events.append(
-            {
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": function_call,
-            }
-        )
-    events.append(
-        {
-            "type": "response.completed",
-            "response": {
-                "status": "completed",
-                "model": "gpt-5.6-luna",
-                "output": terminal_output,
-            },
-        }
-    )
+    storage = make_auth_storage(tmp_path)
+    lm = dspy_codex_auth.LM("codex/gpt-5.5", auth_storage=storage, cache=True)
+    prompt = f"cache account {time.time_ns()}"
+    lm(prompt)
+    data = json.loads(storage.path.read_text())
+    data["tokens"]["account_id"] = "acct_changed"
+    storage.path.write_text(json.dumps(data))
+    lm(prompt)
+    lm(prompt)
+    assert len(client_calls.sync) == 2
 
-    monkeypatch.setattr(
-        codex_lm,
-        "websocket_response",
-        lambda *_args, **_kwargs: codex_lm.WebSocketResult(
-            events=events,
-            response={
-                "status": "completed",
-                "model": "gpt-5.6-luna",
-                "output": terminal_output,
-                "usage": {},
-            },
-        ),
-    )
-    response = codex_lm._codex_websocket_completion(
-        {
-            "model": "openai/gpt-5.6-luna",
-            "messages": [{"role": "user", "content": "hi"}],
-            "api_key": "secret-token",
-            "api_base": "https://chatgpt.com/backend-api/codex",
-            "headers": {"chatgpt-account-id": "acct_test"},
-        },
-        num_retries=0,
-        connect_timeout=10.0,
-        idle_timeout=300.0,
-    )
+
+def test_explicit_codex_provider_preserves_bare_model_id(client_calls):
+    dspy_codex_auth.LM(
+        "gpt-5.5", auth_provider="codex", api_key="synthetic", cache=False
+    )("hello")
+    assert client_calls.sync[0]["model"] == "gpt-5.5"
+
+
+def test_codex_api_base_selects_responses_interface(client_calls):
     lm = dspy_codex_auth.LM(
-        "openai/gpt-5.6-luna",
-        auth_provider="codex",
-        api_key="dummy",
-        chatgpt_account_id="acct_test",
+        "openai/gpt-5.5",
+        api_base=dspy_codex_auth.DEFAULT_CODEX_API_BASE,
+        api_key="synthetic",
         cache=False,
     )
+    assert lm.model_type == "responses"
+    assert lm("hello") == [{"text": "ok"}]
 
-    processed = lm._process_response(response)
 
-    assert processed[0]["tool_calls"][0]["call_id"] == "call_test"
-    assert processed[0]["tool_calls"][0]["name"] == "lookup_weather"
+def test_codex_route_rejects_non_responses_model_type():
+    with pytest.raises(ValueError, match="require model_type='responses'"):
+        make_lm(model_type="chat")

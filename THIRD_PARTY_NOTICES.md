@@ -8,7 +8,8 @@ https://github.com/MaximeRivest/dspy-lm-auth
 
 `dspy-lm-auth` is licensed under the MIT License.
 
-The Codex streamed-output reconstruction implemented here addresses a
+The Codex streamed-output reconstruction now owned by `openai-codex-auth`
+addresses a
 DSPy/Codex Responses streaming compatibility issue that was also discussed in
 `dspy-lm-auth` pull request #2:
 

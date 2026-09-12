@@ -9,6 +9,7 @@ import tomllib
 from pathlib import Path
 
 import openai_codex_auth
+import httpx
 import pytest
 from packaging.requirements import Requirement
 
@@ -28,7 +29,10 @@ def test_project_depends_on_dspy_and_published_openai_codex_auth():
 
     assert {"dspy", "openai-codex-auth"} <= dependencies.keys()
     assert dependencies["openai-codex-auth"].url is None
+    assert "0.2.0" in dependencies["openai-codex-auth"].specifier
+    assert "0.1.0" not in dependencies["openai-codex-auth"].specifier
     assert "dspy-lm-auth" not in dependencies
+    assert {"requests", "websockets"}.isdisjoint(dependencies)
 
 
 def test_auth_dependency_is_locked_to_published_registry_package():
@@ -79,14 +83,17 @@ def test_lm_rejects_pi_credentials_without_modifying_the_file(tmp_path):
     )
     auth_path.write_text(original)
 
+    lm = dspy_codex_auth.LM("codex/gpt-5.5", auth_storage=auth_path, cache=False)
     with pytest.raises(openai_codex_auth.CodexAuthError, match="codex login"):
-        dspy_codex_auth.LM("codex/gpt-5.5", auth_storage=auth_path, cache=False)
+        lm.forward("hello")
 
     assert auth_path.read_text() == original
 
 
 @pytest.mark.parametrize("path_type", (str, Path))
-def test_lm_reads_codex_cli_credentials_from_explicit_path(tmp_path, path_type):
+def test_lm_reads_codex_cli_credentials_from_explicit_path(
+    tmp_path, path_type, monkeypatch
+):
     claims = {
         "exp": int(time.time()) + 3600,
         "https://api.openai.com/auth": {"chatgpt_account_id": "acct_codex"},
@@ -111,5 +118,39 @@ def test_lm_reads_codex_cli_credentials_from_explicit_path(tmp_path, path_type):
         "codex/gpt-5.5", auth_storage=path_type(auth_path), cache=False
     )
 
-    assert lm.kwargs["api_key"] == token
-    assert lm.kwargs["headers"]["chatgpt-account-id"] == "acct_codex"
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        response = {
+            "model": "gpt-5.5",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "hello", "annotations": []}
+                    ],
+                }
+            ],
+        }
+        event = {"type": "response.completed", "response": response}
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=f"data: {json.dumps(event)}\n\n",
+        )
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    result = lm.forward("hello")
+
+    assert len(requests) == 1
+    assert requests[0].headers["authorization"] == f"Bearer {token}"
+    assert requests[0].headers["chatgpt-account-id"] == "acct_codex"
+    assert result.output[0].content[0].text == "hello"
