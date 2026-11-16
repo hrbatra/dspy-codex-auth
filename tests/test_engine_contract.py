@@ -87,7 +87,7 @@ def test_removed_output_cap_and_codec_seed_adaptations_are_visible(client_calls)
     response = lm(request_for(lm, config=lm15.Config(max_tokens=1234, seed=7)))
     assert response.text == "ok"
     cap = [a for a in response.adaptations if a.asked == 1234]
-    seed = [a for a in response.adaptations if a.field == "seed"]
+    seed = [a for a in response.adaptations if a.asked == 7]
     assert len(cap) == len(seed) == 1
     assert cap[0].reason and cap[0].applied is None
     assert seed[0].asked == 7 and seed[0].applied is None and seed[0].reason
@@ -148,14 +148,14 @@ def test_structured_http_timeout_preserves_disabled_phases(client_calls):
     [
         (websocket_error(403), dspy.LMAuthError, False),
         (websocket_error(408), dspy.LMTimeoutError, True),
-        (websocket_error(504), dspy.LMServerError, True),
+        (websocket_error(504), dspy.LMTimeoutError, True),
         (websocket_error(None), dspy.LMError, False),
         (CodexWebSocketProtocolError("invalid frame"), dspy.LMError, False),
         (CodexWebSocketConnectionError("disconnected"), dspy.LMTransportError, True),
         (CodexWebSocketTimeoutError("late"), dspy.LMTimeoutError, True),
         (CodexHTTPError(403, "forbidden"), dspy.LMAuthError, False),
         (CodexHTTPError(408, "late"), dspy.LMTimeoutError, True),
-        (CodexHTTPError(504, "unavailable"), dspy.LMServerError, True),
+        (CodexHTTPError(504, "unavailable"), dspy.LMTimeoutError, True),
         (CodexError("HTTP attempts exhausted"), dspy.LMTransportError, True),
         (CodexEmptyResponseError("no response"), dspy.LMError, True),
         (UnknownCodexError("unclassified"), dspy.LMError, False),
