@@ -18,11 +18,13 @@ from packaging.requirements import Requirement
 import dspy_codex_auth
 
 
+# contract: C6
 def test_user_facing_auth_helpers_are_re_exported():
     for name in ("CodexAuth", "getauthtoken"):
         assert getattr(dspy_codex_auth, name) is getattr(openai_codex_auth, name)
 
 
+# contract: C1
 def test_project_depends_on_dspy_and_published_openai_codex_auth():
     pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
     project = tomllib.loads(pyproject_path.read_text())["project"]
@@ -39,6 +41,7 @@ def test_project_depends_on_dspy_and_published_openai_codex_auth():
     assert {"requests", "websockets"}.isdisjoint(dependencies)
 
 
+# contract: C1
 def test_auth_dependency_is_locked_to_published_registry_package():
     lock_path = Path(__file__).resolve().parents[1] / "uv.lock"
     packages = tomllib.loads(lock_path.read_text())["package"]
@@ -49,6 +52,7 @@ def test_auth_dependency_is_locked_to_published_registry_package():
     assert auth_package["source"] == {"registry": "https://pypi.org/simple"}
 
 
+# contract: C7
 def test_legacy_auth_module_is_removed():
     with pytest.raises(ModuleNotFoundError) as exc_info:
         importlib.import_module("dspy_codex_auth.auth")
@@ -56,6 +60,7 @@ def test_legacy_auth_module_is_removed():
     assert exc_info.value.name == "dspy_codex_auth.auth"
 
 
+# contract: C7
 def test_legacy_auth_apis_are_removed():
     for name in (
         "AuthStorage",
@@ -72,6 +77,7 @@ def test_legacy_auth_apis_are_removed():
         assert not hasattr(dspy_codex_auth, name), name
 
 
+# contract: C5, C6
 def test_lm_rejects_pi_credentials_without_modifying_the_file(tmp_path):
     auth_path = tmp_path / "auth.json"
     original = json.dumps(
@@ -94,6 +100,7 @@ def test_lm_rejects_pi_credentials_without_modifying_the_file(tmp_path):
     assert auth_path.read_text() == original
 
 
+# contract: C5, C6
 @pytest.mark.parametrize("path_type", (str, Path))
 def test_lm_reads_codex_cli_credentials_from_explicit_path(
     tmp_path, path_type, monkeypatch
