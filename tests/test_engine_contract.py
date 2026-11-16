@@ -16,10 +16,13 @@ from openai_codex_auth.responses_websocket import (
     CodexWebSocketResponseError,
     CodexWebSocketTimeoutError,
 )
-
 from test_lm import (
-    block_builtin_provider,  # noqa: F401 -- imported autouse fixture
-    client_calls,  # noqa: F401 -- imported provider boundary fixture
+    block_builtin_provider as block_builtin_provider,  # noqa: PLC0414 -- pytest fixture re-export
+)
+from test_lm import (
+    client_calls as client_calls,  # noqa: PLC0414 -- pytest fixture re-export
+)
+from test_lm import (
     make_lm,
     make_response,
     request_for,
