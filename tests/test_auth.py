@@ -8,9 +8,11 @@ import time
 import tomllib
 from pathlib import Path
 
-import openai_codex_auth
+import dspy
 import httpx
+import openai_codex_auth
 import pytest
+from dspy import lm15
 from packaging.requirements import Requirement
 
 import dspy_codex_auth
@@ -28,6 +30,8 @@ def test_project_depends_on_dspy_and_published_openai_codex_auth():
     dependencies = {requirement.name: requirement for requirement in requirements}
 
     assert {"dspy", "openai-codex-auth"} <= dependencies.keys()
+    assert "3.5.0" in dependencies["dspy"].specifier
+    assert "3.4.0" not in dependencies["dspy"].specifier
     assert dependencies["openai-codex-auth"].url is None
     assert "0.2.0" in dependencies["openai-codex-auth"].specifier
     assert "0.1.0" not in dependencies["openai-codex-auth"].specifier
@@ -84,8 +88,8 @@ def test_lm_rejects_pi_credentials_without_modifying_the_file(tmp_path):
     auth_path.write_text(original)
 
     lm = dspy_codex_auth.LM("codex/gpt-5.5", auth_storage=auth_path, cache=False)
-    with pytest.raises(openai_codex_auth.CodexAuthError, match="codex login"):
-        lm.forward("hello")
+    with pytest.raises(dspy.LMAuthError, match="codex login"):
+        lm(lm15.Request(model=lm.model, messages=(lm15.Message.user("hello"),)))
 
     assert auth_path.read_text() == original
 
@@ -115,7 +119,11 @@ def test_lm_reads_codex_cli_credentials_from_explicit_path(
     )
 
     lm = dspy_codex_auth.LM(
-        "codex/gpt-5.5", auth_storage=path_type(auth_path), cache=False
+        "codex/gpt-5.5",
+        auth_storage=path_type(auth_path),
+        cache=False,
+        codex_transport="http",
+        num_retries=0,
     )
 
     requests = []
@@ -148,9 +156,9 @@ def test_lm_reads_codex_cli_credentials_from_explicit_path(
         "Client",
         lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
     )
-    result = lm.forward("hello")
+    result = lm(lm15.Request(model=lm.model, messages=(lm15.Message.user("hello"),)))
 
     assert len(requests) == 1
     assert requests[0].headers["authorization"] == f"Bearer {token}"
     assert requests[0].headers["chatgpt-account-id"] == "acct_codex"
-    assert result.output[0].content[0].text == "hello"
+    assert result.text == "hello"

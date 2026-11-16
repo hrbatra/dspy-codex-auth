@@ -20,6 +20,8 @@ def main() -> None:
 
 def _check_adapter() -> None:
     import dspy
+    from dspy import lm15
+
     import dspy_codex_auth
 
     assert dspy_codex_auth.CodexTransport is not None
@@ -67,7 +69,11 @@ def _check_adapter() -> None:
                         "role": "assistant",
                         "status": "completed",
                         "content": [
-                            {"type": "output_text", "text": "smoke OK", "annotations": []}
+                            {
+                                "type": "output_text",
+                                "text": "smoke OK",
+                                "annotations": [],
+                            }
                         ],
                     }
                 ],
@@ -110,23 +116,29 @@ def _check_adapter() -> None:
                 cache=False,
                 num_retries=0,
             )
-            messages = [
-                {"role": "system", "content": "Answer briefly."},
-                {"role": "user", "content": "Reply with smoke OK."},
-            ]
+            request = lm15.Request(
+                model=lm.model,
+                system="Answer briefly.",
+                messages=(lm15.Message.user("Reply with smoke OK."),),
+                config=lm15.Config(
+                    reasoning=lm15.Reasoning(effort="low", summary="auto")
+                ),
+            )
             with (
                 patch.object(httpx, "Client", mock_sync_client),
                 patch.object(httpx, "AsyncClient", mock_async_client),
             ):
-                assert lm(messages=messages) == [{"text": "smoke OK"}]
-                assert asyncio.run(lm.acall(messages=messages)) == [{"text": "smoke OK"}]
+                assert lm(request).text == "smoke OK"
+                assert asyncio.run(lm.acall(request)).text == "smoke OK"
             assert request_count == 2
         finally:
             dspy_codex_auth.uninstall()
     assert dspy.LM is original_lm
     assert dspy.clients.LM is original_lm
     assert not hasattr(dspy, "getauthtoken")
-    print("Adapter distribution smoke passed: shared HTTP client, sync/async, install/uninstall.")
+    print(
+        "Adapter distribution smoke passed: shared HTTP client, sync/async, install/uninstall."
+    )
 
 
 if __name__ == "__main__":
