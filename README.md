@@ -63,7 +63,9 @@ lm = dspy.LM("codex/gpt-5.6-luna", cache=False)
 dspy.configure(lm=lm, adapter=dspy.JSONAdapter())
 ```
 
-Use `codex/<model>` for the ChatGPT Codex subscription route. This is not the
+Use a model available to your ChatGPT account with `codex/<model>` for the
+Codex subscription route. The examples use `gpt-5.6-sol`; older model IDs may
+be rejected by the backend. This is not the
 OpenAI API key route and does not require `OPENAI_API_KEY`.
 
 `cache=False` is recommended for Codex while iterating because stale DSPy cache
@@ -187,7 +189,7 @@ def configure_model(model: str, **kwargs):
     return lm
 
 
-codex_lm = configure_model("codex/gpt-5.5", cache=False)
+codex_lm = configure_model("codex/gpt-5.6-sol", cache=False)
 api_lm = configure_model("openai/gpt-5.5", api_key="...", cache=False)
 ```
 
@@ -198,7 +200,7 @@ Pass `reasoning_effort` as usual. This package also supports
 
 ```python
 lm = dspy.LM(
-    "codex/gpt-5.5",
+    "codex/gpt-5.6-sol",
     cache=False,
     reasoning_effort="medium",
     reasoning_summary="detailed",
@@ -253,7 +255,7 @@ spelling directly:
 
 ```python
 lm = dspy.LM(
-    "codex/gpt-5.4",
+    "codex/gpt-5.6-sol",
     cache=False,
     service_tier="fast",
     reasoning_effort="low",
@@ -267,7 +269,7 @@ For raw Codex CLI calls, use `-c` config overrides:
 
 ```bash
 codex exec \
-  -m gpt-5.4 \
+  -m gpt-5.6-sol \
   -c 'service_tier="fast"' \
   -c 'model_reasoning_effort="low"' \
   --json \
@@ -290,7 +292,7 @@ explicitly:
 
 ```python
 lm = dspy_codex_auth.LM(
-    "openai/gpt-5.5",
+    "openai/gpt-5.6-sol",
     auth_provider="codex",
     cache=False,
     reasoning_effort="medium",
@@ -342,7 +344,7 @@ import dspy_codex_auth
 
 dspy_codex_auth.install()
 
-lm = dspy.LM("codex/gpt-5.5", cache=False)
+lm = dspy.LM("codex/gpt-5.6-sol", cache=False)
 dspy.configure(lm=lm, adapter=dspy.JSONAdapter())
 
 
@@ -366,7 +368,7 @@ import dspy_codex_auth
 dspy_codex_auth.install()
 
 lm = dspy.LM(
-    "codex/gpt-5.5",
+    "codex/gpt-5.6-sol",
     cache=False,
     reasoning_effort="medium",
     reasoning_summary="detailed",
