@@ -574,8 +574,8 @@ def test_cache_usage_is_once_per_miss_and_sync_async_are_distinct(client_calls):
     assert len(tracker.calls) == 2
     assert all(
         model == lm.model
-        and usage["input_tokens"] == 12
-        and usage["output_tokens"] == 7
+        and usage["prompt_tokens"] == 12
+        and usage["completion_tokens"] == 7
         for model, usage in tracker.calls
     )
 
@@ -946,4 +946,8 @@ def test_pydantic_schema_on_string_call_reaches_native_format(client_calls):
     assert make_lm()("hello", response_format=Answer) == [{"text": "ok"}]
     output_format = client_calls.sync[0]["text"]["format"]
     assert output_format["type"] == "json_schema"
-    assert output_format["schema"] == Answer.model_json_schema()
+    assert output_format["schema"] == {
+        **Answer.model_json_schema(),
+        "additionalProperties": False,
+    }
+    assert output_format["strict"] is True
