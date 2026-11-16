@@ -951,3 +951,223 @@ def test_pydantic_schema_on_string_call_reaches_native_format(client_calls):
         "additionalProperties": False,
     }
     assert output_format["strict"] is True
+
+
+# contract: C6
+@pytest.mark.parametrize("via_program", [False, True])
+def test_deepcopy_isolates_lm_history_kwargs_and_callbacks(client_calls, via_program):
+    import copy
+
+    from dspy.utils.callback import BaseCallback
+
+    lm = make_lm(text={"verbosity": "low"}, callbacks=[BaseCallback()])
+    lm("before copy")
+    if via_program:
+        program = dspy.Predict("question -> answer")
+        program.set_lm(lm)
+        copied = program.deepcopy().get_lm()
+    else:
+        copied = copy.deepcopy(lm)
+    copied.history.append({"test_copy_only": True})
+    copied.kwargs["text"]["verbosity"] = "high"
+    copied.callbacks.append(BaseCallback())
+    assert len(lm.history) == 1
+    assert lm.kwargs["text"] == {"verbosity": "low"}
+    assert len(lm.callbacks) == 1
+    assert copied("after copy") == [{"text": "ok"}]
+    assert client_calls.sync[-1]["text"]["verbosity"] == "high"
+    assert len(lm.history) == 1
+
+
+# contract: C6
+def test_attached_lm_full_program_save_load_preserves_execution(tmp_path, client_calls):
+    client_calls.response = make_response('{"answer":"restored"}')
+    storage = make_auth_storage(tmp_path)
+    lm = make_lm(auth_storage=storage, codex_transport="http")
+    program = dspy.Predict("question -> answer")
+    program.set_lm(lm)
+    destination = tmp_path / "saved_program"
+    program.save(destination, save_program=True)
+    loaded = dspy.load(destination, allow_pickle=True)
+    with dspy.context(adapter=dspy.JSONAdapter()):
+        assert loaded(question="What survived?").answer == "restored"
+    assert loaded.get_lm().model == "openai/gpt-5.5"
+    assert client_calls.sync[-1]["transport"] == "http"
+    assert client_calls.clients[-1].auth.path == tmp_path / "auth.json"
+
+
+# contract: C6
+def test_prompt_cache_and_structured_timeout_state_are_json_reconstructible(
+    tmp_path, client_calls
+):
+    timeout = httpx.Timeout(connect=None, read=51, write=13, pool=7)
+    cache_config = lm15.CacheConfig(mode="off")
+    lm = make_lm(
+        auth_storage=tmp_path / "auth.json",
+        codex_transport="http",
+        timeout=timeout,
+        prompt_cache=cache_config,
+    )
+    state = json.loads(json.dumps(lm.dump_state()))
+    restored = dspy_codex_auth.LM.load_state(state, allow_custom_lm_class=True)
+    assert restored("restored", api_key="restore-only-key") == [{"text": "ok"}]
+    assert restored.dump_state()["prompt_cache"] == {"mode": "off"}
+    assert client_calls.sync[-1]["timeout"].as_dict() == {
+        "connect": None,
+        "read": 51,
+        "write": 13,
+        "pool": 7,
+    }
+    assert client_calls.clients[-1].auth.path == tmp_path / "auth.json"
+
+
+# contract: C6
+def test_custom_alias_registration_and_removal_are_observable(tmp_path, client_calls):
+    auth = CodexAuth(tmp_path / "missing.json")
+
+    def resolver(model, kwargs, auth_storage):
+        return "openai/gpt-5.5", {
+            **kwargs,
+            "api_base": dspy_codex_auth.DEFAULT_CODEX_API_BASE,
+        }
+
+    dspy_codex_auth.register_model_alias(["test-alias-one", "test-alias-two"], resolver)
+    try:
+        lm = dspy_codex_auth.LM(
+            "test-alias-one/example",
+            auth_storage=auth,
+            api_key="synthetic",
+            cache=False,
+            num_retries=0,
+        )
+        assert lm("hello") == [{"text": "ok"}]
+        assert client_calls.sync[-1]["model"] == "gpt-5.5"
+        assert (
+            dspy_codex_auth.resolve_lm_route(
+                "test-alias-two/example", auth_storage=auth
+            )[0]
+            == "openai/gpt-5.5"
+        )
+    finally:
+        dspy_codex_auth.unregister_model_alias("test-alias-one")
+        dspy_codex_auth.unregister_model_alias("test-alias-two")
+    assert dspy_codex_auth.resolve_lm_route(
+        "test-alias-one/example", auth_storage=auth
+    ) == ("test-alias-one/example", {})
+    with pytest.raises(ValueError):
+        dspy_codex_auth.LM(
+            "gpt-5.5",
+            auth_provider="unregistered-provider",
+            auth_storage=auth,
+            api_key="synthetic",
+        )
+
+
+# contract: C6
+def test_non_codex_copy_and_state_roundtrip_preserve_dspy_behavior():
+    lm = dspy_codex_auth.LM(
+        "openai/gpt-4.1", api_key="synthetic", cache=False, num_retries=0
+    )
+    copied = lm.copy(temperature=0.4)
+    state = json.loads(json.dumps(copied.dump_state()))
+    restored = dspy_codex_auth.LM.load_state(state, allow_custom_lm_class=True)
+    assert restored.model == lm.model
+    result = restored(
+        lm15.Request(model=restored.model, messages=(lm15.Message.user("hello"),)),
+        api_key="synthetic",
+    )
+    assert result.text == "BUILTIN_ROUTE_BYPASS"
+    assert lm.history == [] and copied.history == []
+    assert restored.kwargs["temperature"] == 0.4
+
+
+# contract: C6
+def test_install_without_helpers_and_repeated_uninstall(tmp_path):
+    original = dspy.LM
+    try:
+        dspy_codex_auth.install(
+            auth_storage=tmp_path / "missing.json", attach_helpers=False
+        )
+        assert not hasattr(dspy, "getauthtoken")
+        assert isinstance(dspy.LM("codex/gpt-5.5"), dspy_codex_auth.LM)
+    finally:
+        dspy_codex_auth.uninstall()
+        dspy_codex_auth.uninstall()
+    assert dspy.LM == original
+    assert not hasattr(dspy, "getauthtoken")
+
+
+# contract: C7
+@pytest.mark.parametrize("prompt", [42, {}, ["hello"], object()])
+def test_invalid_prompt_shapes_fail_before_provider_io(client_calls, prompt):
+    with pytest.raises(TypeError):
+        make_lm()(prompt)
+    assert not client_calls.sync
+
+
+# contract: C1, C7
+def test_request_keyword_works_but_duplicate_request_is_rejected(client_calls):
+    lm = make_lm()
+    request = request_for(lm)
+    assert lm(request=request).text == "ok"
+    assert asyncio.run(lm.acall(request=request)).text == "ok"
+    with pytest.raises(TypeError):
+        lm("duplicate", request=request)
+    with pytest.raises(TypeError):
+        asyncio.run(lm.acall("duplicate", request=request))
+    assert len(client_calls.sync) == len(client_calls.async_) == 1
+
+
+# contract: C6
+def test_alias_reregistration_does_not_change_existing_lm_copy_or_saved_state(
+    tmp_path, client_calls
+):
+    storage = make_auth_storage(tmp_path)
+
+    def resolver_a(model, kwargs, auth_storage):
+        return "openai/gpt-alias-a", {
+            **kwargs,
+            "api_base": dspy_codex_auth.DEFAULT_CODEX_API_BASE,
+        }
+
+    def resolver_b(model, kwargs, auth_storage):
+        return "openai/gpt-alias-b", {
+            **kwargs,
+            "api_base": dspy_codex_auth.DEFAULT_CODEX_API_BASE,
+        }
+
+    dspy_codex_auth.register_model_alias("frozen-alias", resolver_a)
+    try:
+        original = dspy_codex_auth.LM(
+            "frozen-alias/example",
+            auth_storage=storage,
+            api_key="synthetic",
+            cache=False,
+            num_retries=0,
+        )
+        dspy_codex_auth.register_model_alias("frozen-alias", resolver_b)
+        copied = original.copy()
+        restored = dspy_codex_auth.LM.load_state(
+            json.loads(json.dumps(original.dump_state())), allow_custom_lm_class=True
+        )
+        newer = dspy_codex_auth.LM(
+            "frozen-alias/example",
+            auth_storage=storage,
+            api_key="synthetic",
+            cache=False,
+            num_retries=0,
+        )
+        assert (original.model, copied.model, restored.model, newer.model) == (
+            "openai/gpt-alias-a",
+            "openai/gpt-alias-a",
+            "openai/gpt-alias-a",
+            "openai/gpt-alias-b",
+        )
+        assert copied("copy") == [{"text": "ok"}]
+        assert restored("restore", api_key="synthetic") == [{"text": "ok"}]
+        assert [call["model"] for call in client_calls.sync] == [
+            "gpt-alias-a",
+            "gpt-alias-a",
+        ]
+    finally:
+        dspy_codex_auth.unregister_model_alias("frozen-alias")
