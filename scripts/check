@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+
+cd "$(dirname "$0")/.."
+
+check_dir=$(mktemp -d "${TMPDIR:-/tmp}/dspy-codex-auth-check.XXXXXX")
+trap 'rm -rf "$check_dir"' EXIT HUP INT TERM
+export DSPY_CACHEDIR="$check_dir/cache"
+export LITELLM_LOCAL_MODEL_COST_MAP=True
+
+uv run --locked ruff check .
+uv run --locked pytest
+uv build --no-sources --out-dir "$check_dir/dist"
+uv run --isolated --no-project --with "$check_dir"/dist/*.whl \
+  python tests/smoke_test.py

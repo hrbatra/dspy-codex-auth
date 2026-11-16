@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.3.0 - 2026-11-15
+
+### Breaking changes
+
+- Require DSPy 3.5 or newer. The adapter now uses sync and async engines with
+  `complete(Request) -> Response`, replacing the deprecated `forward` and
+  `aforward` integration hooks.
+- Direct `messages=` calls and `forward`/`aforward` are removed. Use
+  `dspy.lm15.Request`, `Message`, and `Config` for direct structured calls.
+  `lm("text")`, `await lm.acall("text")`, and `dspy.Predict` remain supported.
+- Typed requests return a `dspy.lm15.Response` and take generation settings only
+  from `Request.config`. Native usage and reasoning are available on that
+  response. Raw Codex metadata and the selected transport live under
+  `response.provider_data["codex_response"]` and `["codex_transport"]`.
+- DSPy now owns retries and usage accounting. `num_retries` still counts
+  additional attempts, with DSPy's 1, 2, 4, ... second delays capped at 60
+  seconds. The shared client runs one attempt per engine invocation.
+- Provider failures and refusals surface through DSPy's public LM error family.
+- Stop sequences raise `LMUnsupportedFeatureError` before provider I/O. The
+  completion-only engine cannot stop generation at a matching sequence.
+- Dropped or clamped Responses codec options and removed output-token caps
+  are reported in `Response.adaptations`.
+
+### Fixed
+
+- Codex calls use the shared authenticated client on DSPy 3.5, instead of
+  bypassing the adapter and reaching DSPy's built-in transport.
+- Retain sync/async behavior, transport overrides, account-separated caches,
+  and current file-backed credentials under the engine interface.
+- Keep credentials and custom headers out of `LM.dump_state()` JSON state;
+  preserve route and transport settings when copying or restoring an LM.
+  DSPy's full-program pickle retains runtime objects and is not this sanitized
+  JSON format.
+- Preserve deepcopy and full-program save/load. Copies and saved LM state bind
+  the resolved Codex model rather than a mutable custom alias registration.
+
+Restart notebook kernels after upgrading to replace already imported classes.
+
 ## 0.2.0 - 2026-09-11
 
 ### Changed

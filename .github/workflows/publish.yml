@@ -17,9 +17,9 @@ jobs:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
       - run: uv python install 3.12
-      - run: uv sync --dev
-      - run: uv run ruff check .
-      - run: uv run pytest
+      - run: uv sync --locked --dev
+      - run: uv run --locked ruff check .
+      - run: uv run --locked pytest
       - run: uv build --no-sources
-      - run: uv run --isolated --no-project --with dist/*.whl tests/smoke_test.py
+      - run: uv run --isolated --no-project --with dist/*.whl python tests/smoke_test.py
       - uses: pypa/gh-action-pypi-publish@release/v1

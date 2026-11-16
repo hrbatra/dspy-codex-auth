@@ -1,6 +1,6 @@
 [project]
 name = "dspy-codex-auth"
-version = "0.2.0"
+version = "0.3.0"
 description = "DSPy integration for ChatGPT Codex subscription-backed language models"
 readme = "README.md"
 authors = [
@@ -34,6 +34,7 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "coverage>=7.17.3",
     "pytest>=9.0.3",
     "ruff>=0.15.12",
 ]

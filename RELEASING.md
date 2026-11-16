@@ -19,11 +19,11 @@ Codex CLI credentials, HTTP/WebSocket transports, and streaming reconstruction.
 This repository owns DSPy integration; the core client also works independently
 of DSPy. No Pi plugin or credential store is required.
 
-`pyproject.toml` and `uv.lock` resolve the auth package from PyPI, with no local
+The 0.3 series requires DSPy 3.5+. `pyproject.toml` and `uv.lock` resolve the auth package from PyPI, with no local
 path source. When a change here needs a newer auth API, release
 `openai-codex-auth` first, update the dependency with `uv add`, and commit
 `pyproject.toml` and `uv.lock`. Verify with `uv sync --locked --dev` and
-`uv build --no-sources` before releasing.
+`scripts/check` before releasing.
 
 ## Local Release
 
@@ -38,71 +38,78 @@ git status --short
 git pull --ff-only origin main
 ```
 
-2. Make and commit the change.
-
-```bash
-uv run ruff format .
-uv run ruff check .
-uv run pytest
-git add .
-git commit -m "Describe the change"
-git push origin main
-```
-
-3. Bump the version.
+2. Make the change, update `CHANGELOG.md`, and bump the version with uv.
 
 ```bash
 uv version --bump patch
 ```
 
-Use `--bump minor` or `--bump major` only for larger compatibility changes.
+Use `--bump minor` or `--bump major` for larger compatibility changes. The
+DSPy 3.5 migration is the minor release 0.3.0. Do not edit `pyproject.toml`
+manually to change the version or dependencies.
 
-4. Build and verify the distributions.
+3. Verify the source and an isolated installation of its wheel.
 
 ```bash
-rm -rf dist
-uv build --no-sources
-uv run --with twine python -m twine check dist/*
+uv sync --locked --dev
+scripts/check
 ```
 
-5. Commit and push the version bump.
+The check runs lint, tests, a temporary distribution build, and the offline
+sync/async smoke test. This exercises the installed adapter and shared client;
+it does not require live subscription credentials.
+
+4. Build and verify the release distributions.
 
 ```bash
-version=$(uv version --short)
-git add pyproject.toml uv.lock
-git commit -m "Release $version"
+release_version=$(uv version --short)
+uv build --no-sources
+uv run --with twine python -m twine check \
+  "dist/dspy_codex_auth-$release_version-py3-none-any.whl" \
+  "dist/dspy_codex_auth-$release_version.tar.gz"
+```
+
+Use the exact versioned paths when uploading so older files in `dist/` cannot
+be published accidentally.
+
+5. Commit the reviewed change and version bump, then push to GitHub.
+
+```bash
+git diff --check
+git status --short
+# Stage only the files intended for this release.
+git add pyproject.toml uv.lock CHANGELOG.md
+git commit -m "Release $release_version"
 git push origin main
 ```
 
-6. Upload to PyPI.
+Ensure all implementation, test, and documentation changes are committed too.
+Check that GitHub CI passes on the pushed commit before publishing.
+
+6. Upload to PyPI using **one** publishing path.
+
+For a local token-based upload:
 
 ```bash
-uv run --with twine python -m twine upload dist/*
+uv run --with twine python -m twine upload \
+  "dist/dspy_codex_auth-$release_version-py3-none-any.whl" \
+  "dist/dspy_codex_auth-$release_version.tar.gz"
 ```
 
-7. Verify PyPI and a fresh install.
+Alternatively, use the tag-triggered Trusted Publishing workflow below. Do not
+also upload the same version locally: PyPI releases are immutable, and a second
+upload will fail.
+
+7. Verify a fresh install from PyPI.
 
 ```bash
-curl -s https://pypi.org/pypi/dspy-codex-auth/json | python3 -m json.tool | head
-
-tmpdir=$(mktemp -d /tmp/dspy-codex-auth-pypi.XXXXXX)
-cd "$tmpdir"
-uv init --bare
-uv add --refresh dspy-codex-auth
-uv run python - <<'PY'
-import importlib.metadata
-import importlib.util
-import dspy_codex_auth
-
-print(importlib.metadata.version("dspy-codex-auth"))
-print(importlib.util.find_spec("dspy_lm_auth"))
-print(dspy_codex_auth.LM.__module__)
-PY
-rm -rf "$tmpdir"
+uv run --isolated --no-project --refresh \
+  --with "dspy-codex-auth==$release_version" python tests/smoke_test.py
 ```
 
-`find_spec("dspy_lm_auth")` should print `None`; `dspy-codex-auth` should not
-install `dspy-lm-auth` as a runtime dependency.
+This resolves the published package rather than the working tree. Confirm the
+same version is listed on PyPI, and include a notebook-kernel restart in the
+upgrade instructions for users.
 
 ## If PyPI or uv Shows the Previous Version
 
@@ -138,13 +145,18 @@ through PyPI Trusted Publishing if PyPI is configured for:
 - Environment: `pypi`
 
 Once that is configured, release by pushing a tag after the version bump is
-committed:
+committed, pushed, and CI passes:
 
 ```bash
-version=$(uv version --short)
-git tag "v$version"
-git push origin "v$version"
+release_version=$(uv version --short)
+git tag "v$release_version"
+git push origin "v$release_version"
 ```
+
+Verify the Publish workflow succeeds and then run the fresh PyPI smoke test
+above. A repository workflow alone does not prove the corresponding Trusted
+Publisher is registered in PyPI; a token-based local upload is the other
+documented release path.
 
 Do not reuse tags or PyPI versions. If a release fails after uploading any file,
 bump to a new version before trying again.
